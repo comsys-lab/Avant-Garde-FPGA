@@ -16,3 +16,7 @@ miscs/apptainer/vortex.sif
 *.wdb
 *.vcd
 build*/
+tests/kernel/**/*.bin
+tests/kernel/**/*.dump
+tests/kernel/**/*.elf
+tests/kernel/**/trace/
