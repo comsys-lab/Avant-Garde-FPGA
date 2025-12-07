@@ -1,11 +1,12 @@
 ROOT_DIR := $(realpath ../../..)
 
-TARGET ?= opaesim
+TARGET ?= xrt
 
 XRT_SYN_DIR ?= $(VORTEX_HOME)/hw/syn/xilinx/xrt
 XRT_DEVICE_INDEX ?= 0
 
 VORTEX_RT_PATH ?= $(ROOT_DIR)/runtime
+#VORTEX_RT_PATH ?= $(ROOT_DIR)/build/runtime
 VORTEX_KN_PATH ?= $(ROOT_DIR)/kernel
 
 ifeq ($(XLEN),64)
@@ -21,13 +22,14 @@ else
 	else
 		VX_CFLAGS += -march=rv32imaf -mabi=ilp32f
 	endif
-	STARTUP_ADDR ?= 0x80000000
+	STARTUP_ADDR ?= 0x20000
 endif
 
 LLVM_CFLAGS += --sysroot=$(RISCV_SYSROOT)
 LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH)
-LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex
-LLVM_CFLAGS += -Xclang -target-feature -Xclang +zicond
+#LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex
+#LLVM_CFLAGS += -Xclang -target-feature -Xclang +zicond
+
 LLVM_CFLAGS += -mllvm -disable-loop-idiom-all # disable memset/memcpy loop idiom
 #LLVM_CFLAGS += -mllvm -vortex-branch-divergence=0
 #LLVM_CFLAGS += -mllvm -debug -mllvm -print-after-all
@@ -84,7 +86,17 @@ endif
 endif
 endif
 
-all: $(PROJECT) kernel.vxbin kernel.dump
+all: $(PROJECT) kernel.vxbin kernel.dump kernel.hex
+
+kernel.hex: kernel.elf
+	$(VX_CP) -O binary $< kernel.bin
+	od -v -An -t x1 kernel.bin > $@
+	rm kernel.bin
+
+kernel.dat: kernel.elf
+	$(VX_CP) -O binary $< kernel.bin
+	od -v -An -t x4 -w4 kernel.bin | tr -s ' ' | cut -d ' ' -f 2 > $@
+	rm kernel.bin
 
 kernel.dump: kernel.elf
 	$(VX_DP) -D $< > $@

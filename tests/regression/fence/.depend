@@ -1,3 +1,0 @@
-main.o: /home/yonghun/vortex/tests/regression/fence/main.cpp \
- /home/yonghun/vortex/runtime/include/vortex.h \
- /home/yonghun/vortex/tests/regression/fence/common.h

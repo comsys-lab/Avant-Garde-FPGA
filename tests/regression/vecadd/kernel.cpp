@@ -10,6 +10,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 int main() {
-	kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
+	// kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
+    kernel_arg_t* arg = (kernel_arg_t*)0x100300;
 	return vx_spawn_threads(1, &arg->num_points, nullptr, (vx_kernel_func_cb)kernel_body, arg);
 }

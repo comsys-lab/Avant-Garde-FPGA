@@ -145,6 +145,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 			case (state)
 			STATE_IDLE: begin
 				if (ap_start) begin
+                    $display("%t: [AFU-WRAP] STATE_IDLE -> STATE_INIT (ap_start=1)", $time);
 				`ifdef DBG_TRACE_AFU
 					`TRACE(2, ("%t: AFU: Begin initialization\n", $time))
 				`endif
@@ -157,6 +158,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 				if (vx_reset) begin
 					// wait for reset to complete
 					if (vx_reset_ctr == 0) begin
+                        $display("%t: [AFU-WRAP] STATE_INIT: Reset sequence complete, releasing vx_reset", $time);
 					`ifdef DBG_TRACE_AFU
 						`TRACE(2, ("%t: AFU: Initialization completed\n", $time))
 					`endif
@@ -165,6 +167,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 				end else begin
 					// wait until processor goes busy
 					if (vx_busy) begin
+                        $display("%t: [AFU-WRAP] STATE_INIT -> STATE_RUN (vx_busy=1)", $time);
 					`ifdef DBG_TRACE_AFU
 						`TRACE(2, ("%t: AFU: Begin execution\n", $time))
 					`endif
@@ -175,6 +178,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 			STATE_RUN: begin
 				// wait until the processor is not busy
 				if (~vx_busy) begin
+                    $display("%t: [AFU-WRAP] STATE_RUN -> STATE_DONE (vx_busy=0)", $time);
 				`ifdef DBG_TRACE_AFU
 					`TRACE(2, ("%t: AFU: Execution completed\n", $time))
 				`endif
@@ -184,6 +188,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 			STATE_DONE: begin
 				// wait for host's done acknowledgement
 				if (ap_done_ack) begin
+                    $display("%t: [AFU-WRAP] STATE_DONE -> STATE_IDLE (ap_done_ack=1)", $time);
 				`ifdef DBG_TRACE_AFU
 					`TRACE(2, ("%t: AFU: Processor idle\n", $time))
 				`endif
@@ -287,8 +292,10 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 	wire [M_AXI_MEM_ADDR_WIDTH-1:0] m_axi_mem_araddr_u [C_M_AXI_MEM_NUM_BANKS];
 
 	for (genvar i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin : g_addressing
-		assign m_axi_mem_awaddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_awaddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(`PLATFORM_MEMORY_OFFSET);
-		assign m_axi_mem_araddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_araddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(`PLATFORM_MEMORY_OFFSET);
+    // Force offset for debugging
+    localparam [C_M_AXI_MEM_ADDR_WIDTH-1:0] AXI_MEM_OFFSET = 32'h44A00000;
+		assign m_axi_mem_awaddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_awaddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(0) + AXI_MEM_OFFSET;
+		assign m_axi_mem_araddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_araddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(0) + AXI_MEM_OFFSET;
 	end
 
 	`SCOPE_IO_SWITCH (2);
@@ -356,6 +363,15 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 	);
 
     // SCOPE //////////////////////////////////////////////////////////////////////
+    generate
+        for (genvar i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin : g_debug_trace
+            always @(posedge clk) begin
+                if (m_axi_mem_arvalid_a[i]) begin
+                    $display("%t: AXI RD REQ: [%0d] addr=0x%0h (valid=%b)", $time, i, m_axi_mem_araddr_a[i], m_axi_mem_arvalid_a[i]);
+                end
+            end
+        end
+    endgenerate
 
 `ifdef SCOPE
 `ifdef DBG_SCOPE_AFU
@@ -462,18 +478,19 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     always @(posedge clk) begin
 		for (integer i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin
 			if (m_axi_mem_awvalid_a[i] && m_axi_mem_awready_a[i]) begin
+                $display("%t: [AFU-AXI] WR REQ [%0d]: addr=0x%0h, id=0x%0h", $time, i, m_axi_mem_awaddr_a[i], m_axi_mem_awid_a[i]);
 				`TRACE(2, ("%t: AXI Wr Req [%0d]: addr=0x%0h, id=0x%0h\n", $time, i, m_axi_mem_awaddr_a[i], m_axi_mem_awid_a[i]))
 			end
 			if (m_axi_mem_wvalid_a[i] && m_axi_mem_wready_a[i]) begin
 				`TRACE(2, ("%t: AXI Wr Req [%0d]: strb=0x%h, data=0x%h\n", $time, i, m_axi_mem_wstrb_a[i], m_axi_mem_wdata_a[i]))
 			end
-			if (m_axi_mem_bvalid_a[i] && m_axi_mem_bready_a[i]) begin
-				`TRACE(2, ("%t: AXI Wr Rsp [%0d]: id=0x%0h\n", $time, i, m_axi_mem_bid_a[i]))
-			end
+
 			if (m_axi_mem_arvalid_a[i] && m_axi_mem_arready_a[i]) begin
+                $display("%t: [AFU-AXI] RD REQ [%0d]: addr=0x%0h, id=0x%0h", $time, i, m_axi_mem_araddr_a[i], m_axi_mem_arid_a[i]);
 				`TRACE(2, ("%t: AXI Rd Req [%0d]: addr=0x%0h, id=0x%0h\n", $time, i, m_axi_mem_araddr_a[i], m_axi_mem_arid_a[i]))
 			end
 			if (m_axi_mem_rvalid_a[i] && m_axi_mem_rready_a[i]) begin
+                $display("%t: [AFU-AXI] RD RSP [%0d]: data=0x%h, id=0x%0h", $time, i, m_axi_mem_rdata_a[i], m_axi_mem_rid_a[i]);
 				`TRACE(2, ("%t: AXI Rd Rsp [%0d]: data=0x%h, id=0x%0h\n", $time, i, m_axi_mem_rdata_a[i], m_axi_mem_rid_a[i]))
 			end
 		end

@@ -35,6 +35,7 @@
 #include <unordered_map>
 #include <util.h>
 #include <vector>
+#include <cstring>
 
 using namespace vortex;
 
@@ -100,7 +101,7 @@ static void dump_xrt_error(xrtDeviceHandle xrtDevice, xrtErrorCode err) {
 class vx_device {
 public:
   vx_device()
-    : global_mem_(ALLOC_BASE_ADDR,
+    : global_mem_(0x100000,
                   GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR,
                   RAM_PAGE_SIZE,
                   CACHE_BLOCK_SIZE)
@@ -227,7 +228,7 @@ public:
     xrtBuffers_.reserve(num_banks);
     for (uint32_t i = 0; i < num_banks; ++i) {
     #ifdef CPP_API
-      xrtBuffers_.emplace_back(xrtDevice_, bank_size, xrt::bo::flags::normal, i);
+      xrtBuffers_.emplace_back(xrtDevice_, bank_size, xrt::bo::flags::cacheable, i);
     #else
       CHECK_HANDLE(xrtBuffer, xrtBOAlloc(xrtDevice_, bank_size, XRT_BO_FLAGS_NONE, i), {
          return -1;
@@ -452,9 +453,16 @@ public:
       return -1;
 
     auto asize = aligned_size(size, CACHE_BLOCK_SIZE);
-
+    uint64_t dev_addr_start = dev_addr;
+  if (dev_addr_start < 0x40000000 && 
+     (nullptr == std::getenv("XCL_EMULATION_MODE") || 
+      std::string(std::getenv("XCL_EMULATION_MODE")) == "hw_emu")) {
+     //dev_addr_start += 0x44A00000;
+  }
+  //printf("DEBUG: upload dev_addr=0x%lx, dev_addr_start=0x%lx, mode=%s\n", dev_addr, dev_addr_start, std::getenv("XCL_EMULATION_MODE") ? std::getenv("XCL_EMULATION_MODE") : "nullptr");
+  uintptr_t dev_addr_end = dev_addr_start + size;
     // bound checking
-    if (dev_addr + asize > global_mem_size_)
+    if (dev_addr_end > global_mem_size_)
       return -1;
 
     for (uint64_t end = dev_addr + asize; dev_addr < end;
@@ -462,7 +470,7 @@ public:
     #ifdef BANK_INTERLEAVE
       asize = CACHE_BLOCK_SIZE;
     #else
-      end = 0;
+      asize = CACHE_BLOCK_SIZE;
     #endif
       uint32_t bo_index;
       uint64_t bo_offset;
@@ -470,23 +478,56 @@ public:
       CHECK_ERR(this->get_bank_info(dev_addr, &bo_index, &bo_offset), {
         return err;
       });
+      // Apply offset AFTER bank mapping
+      if (dev_addr < 0x40000000 && 
+         (nullptr == std::getenv("XCL_EMULATION_MODE") || 
+          std::string(std::getenv("XCL_EMULATION_MODE")) == "hw_emu")) {
+         //bo_offset += 0x44A00000;
+      }
+
       CHECK_ERR(this->get_buffer(bo_index, &xrtBuffer), {
         return err;
       });
     #ifdef CPP_API
-      xrtBuffer.write(host_ptr, size, bo_offset);
-      xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, size, bo_offset);
+      if (dev_addr < 0x40000000 && 
+         (nullptr == std::getenv("XCL_EMULATION_MODE") || 
+          std::string(std::getenv("XCL_EMULATION_MODE")) == "hw_emu")) {
+         bo_offset += 0x44A00000;
+      }
+      auto ptr = (uint8_t*)xrtBuffer.map();
+      //printf("DEBUG: upload 0x%lx ptr=%p *ptr=%02x bo_offset=0x%lx\n", dev_addr, ptr, *(ptr + bo_offset), bo_offset);
+      std::memcpy(ptr + bo_offset, host_ptr, CACHE_BLOCK_SIZE);
+      xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, CACHE_BLOCK_SIZE, bo_offset);
     #else
-      CHECK_ERR(xrtBOWrite(xrtBuffer, host_ptr, size, bo_offset), {
+      // Dual Write Strategy
+      uint64_t bo_offset_secondary = bo_offset + 0x44A00000;
+      // printf("DEBUG: C-API upload 0x%lx bo_offset=0x%lx secondary=0x%lx\n", dev_addr, bo_offset, bo_offset_secondary);
+      
+      // Write 1: Base Offset
+      CHECK_ERR(xrtBOWrite(xrtBuffer, host_ptr, CACHE_BLOCK_SIZE, bo_offset), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
-      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_TO_DEVICE, size, bo_offset), {
-        dump_xrt_error(xrtDevice_, err);
-        return err;
+      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_TO_DEVICE, CACHE_BLOCK_SIZE, bo_offset), {
+         dump_xrt_error(xrtDevice_, err);
+         return err;
       });
-#endif
+
+      // Write 2: 0x44A00000 Offset (Only for hw_emu if needed, but safe to do always if bounds ok)
+      if (nullptr == std::getenv("XCL_EMULATION_MODE") || 
+          std::string(std::getenv("XCL_EMULATION_MODE")) == "hw_emu") {
+          CHECK_ERR(xrtBOWrite(xrtBuffer, host_ptr, CACHE_BLOCK_SIZE, bo_offset_secondary), {
+            dump_xrt_error(xrtDevice_, err);
+            return err;
+          });
+          CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_TO_DEVICE, CACHE_BLOCK_SIZE, bo_offset_secondary), {
+             dump_xrt_error(xrtDevice_, err);
+             return err;
+          });
+      }
+    #endif
     }
+
     return 0;
   }
 
@@ -508,7 +549,7 @@ public:
     #ifdef BANK_INTERLEAVE
       asize = CACHE_BLOCK_SIZE;
     #else
-      end = 0;
+      asize = CACHE_BLOCK_SIZE;
     #endif
       uint32_t bo_index;
       uint64_t bo_offset;
@@ -520,14 +561,23 @@ public:
         return err;
       });
     #ifdef CPP_API
-      xrtBuffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size, bo_offset);
-      xrtBuffer.read(host_ptr, size, bo_offset);
+      auto ptr = (uint8_t*)xrtBuffer.map();
+      xrtBuffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE, CACHE_BLOCK_SIZE, bo_offset);
+      std::memcpy(host_ptr, ptr + bo_offset, CACHE_BLOCK_SIZE);
     #else
-      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_FROM_DEVICE, size, bo_offset), {
+      uint64_t bo_offset_read = bo_offset;
+      if (dev_addr < 0x40000000 && 
+         (nullptr == std::getenv("XCL_EMULATION_MODE") || 
+          std::string(std::getenv("XCL_EMULATION_MODE")) == "hw_emu")) {
+         bo_offset_read += 0x44A00000;
+      }
+      // printf("DEBUG: C-API download 0x%lx bo_offset=0x%lx read_offset=0x%lx\n", dev_addr, bo_offset, bo_offset_read);
+
+      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_FROM_DEVICE, CACHE_BLOCK_SIZE, bo_offset_read), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
-      CHECK_ERR(xrtBORead(xrtBuffer, host_ptr, size, bo_offset), {
+      CHECK_ERR(xrtBORead(xrtBuffer, host_ptr, CACHE_BLOCK_SIZE, bo_offset_read), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
@@ -537,6 +587,7 @@ public:
   }
 
   int start(uint64_t krnl_addr, uint64_t args_addr) {
+    //printf("DEBUG: start krnl_addr=0x%lx, args_addr=0x%lx\n", krnl_addr, args_addr);
     // set kernel info
     CHECK_ERR(this->dcr_write(VX_DCR_BASE_STARTUP_ADDR0, krnl_addr & 0xffffffff), {
       return err;
@@ -622,6 +673,51 @@ public:
     return 0;
   }
 
+  int test_mem_pattern(uint64_t dev_addr, uint64_t size) {
+    std::vector<uint8_t> host_in(size);
+    std::vector<uint8_t> host_out(size);
+
+    // 0x00, 0x01, 0x02, ... 패턴 채우기
+    for (uint64_t i = 0; i < size; ++i) {
+      host_in[i] = static_cast<uint8_t>(i & 0xFF);
+    }
+
+    printf("[TEST] upload pattern to 0x%lx (size=%lu)\n", dev_addr, size);
+    int err = this->upload(dev_addr, host_in.data(), size);
+    if (err) {
+      printf("[TEST] upload failed: %d\n", err);
+      return err;
+    }
+
+    printf("[TEST] download pattern from 0x%lx (size=%lu)\n", dev_addr, size);
+    err = this->download(host_out.data(), dev_addr, size);
+    if (err) {
+      printf("[TEST] download failed: %d\n", err);
+      return err;
+    }
+
+    // 비교
+    int mismatches = 0;
+    for (uint64_t i = 0; i < size; ++i) {
+      if (host_in[i] != host_out[i]) {
+        if (mismatches < 10) {
+          printf("[TEST] mismatch at %lu: expected=%02x actual=%02x\n",
+                 i, host_in[i], host_out[i]);
+        }
+        ++mismatches;
+      }
+    }
+
+    if (mismatches > 0) {
+      printf("[TEST] pattern FAILED at 0x%lx (size=%lu, mismatches=%d)\n", 
+             dev_addr, size, mismatches);
+      return -1;
+    }
+
+    printf("[TEST] pattern OK at 0x%lx (size=%lu)\n", dev_addr, size);
+    return 0;
+  }
+
 private:
 
   MemoryAllocator global_mem_;
@@ -640,17 +736,20 @@ private:
   std::vector<xrt_buffer_t> xrtBuffers_;
 
   int get_bank_info(uint64_t addr, uint32_t *pIdx, uint64_t *pOff) {
-    uint32_t num_banks = 1 << lg2_num_banks_;
+    // uint32_t num_banks = 1 << lg2_num_banks_;
+    uint32_t num_banks = 1; // FORCE LINEAR
     uint64_t block_addr = addr / CACHE_BLOCK_SIZE;
     uint32_t index = block_addr & (num_banks - 1);
-    uint64_t offset = (block_addr >> lg2_num_banks_) * CACHE_BLOCK_SIZE;
+    // uint64_t offset = (block_addr >> lg2_num_banks_) * CACHE_BLOCK_SIZE;
+    uint64_t offset = block_addr * CACHE_BLOCK_SIZE; // FORCE LINEAR
     if (pIdx) {
       *pIdx = index;
     }
     if (pOff) {
       *pOff = offset;
     }
-    //printf("get_bank_info(addr=0x%lx, bank=%d, offset=0x%lx\n", addr, index, offset);
+    // printf("DEBUG: get_bank_info addr=0x%lx -> idx=%d off=0x%lx\n", addr, index, offset);
+    printf("get_bank_info(addr=0x%lx, bank=%d, offset=0x%lx\n", addr, index, offset);
     return 0;
   }
 
@@ -701,6 +800,7 @@ private:
     } else {
       printf("allocating bank%d...\n", bank_id);
       uint64_t bank_size = 1ull << lg2_bank_size_;
+      //uint64_t bank_size = 256ull * 1024 * 1024; // 256MB
     #ifdef CPP_API
       xrt::bo xrtBuffer(xrtDevice_, bank_size, xrt::bo::flags::normal, bank_id);
     #else

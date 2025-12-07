@@ -1,4 +1,0 @@
-main.o: /home/yonghun/vortex/tests/regression/io_addr/main.cpp \
- /home/yonghun/vortex/runtime/include/vortex.h \
- /home/yonghun/vortex/hw/VX_config.h \
- /home/yonghun/vortex/tests/regression/io_addr/common.h

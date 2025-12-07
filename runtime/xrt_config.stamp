@@ -1,1 +1,1 @@
--std=c++17 -Wall -Wextra -Wfatal-errors -I/home/yonghun/vortex/runtime/include -I/home/yonghun/vortex/hw -I/opt/xilinx/xrt/include -I/home/yonghun/vortex/sim/common -I/home/yonghun/vortex/runtime/common -DXLEN_32 -fPIC -O2 -DNDEBUG
+-std=c++17 -Wall -Wextra -Wfatal-errors -I/home/yonghun/vortex/runtime/include -I/home/yonghun/vortex/hw -I/opt/xilinx/xrt/include -I/home/yonghun/vortex/sim/common -I/home/yonghun/vortex/runtime/common -DXLEN_32 -fPIC -DXRTSIM -I/home/yonghun/vortex/sim/xrtsim -O2 -DNDEBUG

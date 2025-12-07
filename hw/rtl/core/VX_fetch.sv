@@ -14,24 +14,32 @@
 `include "VX_define.vh"
 
 module VX_fetch import VX_gpu_pkg::*; #(
+    parameter CORE_ID = 0,
     parameter `STRING INSTANCE_ID = ""
 ) (
-    `SCOPE_IO_DECL
-
-    input  wire             clk,
-    input  wire             reset,
+    input wire clk,
+    input wire reset,
 
     // Icache interface
     VX_mem_bus_if.master    icache_bus_if,
 
-    // inputs
+    // Schedule interface
     VX_schedule_if.slave    schedule_if,
 
-    // outputs
+    // Decode interface
     VX_fetch_if.master      fetch_if
 );
-    `UNUSED_SPARAM (INSTANCE_ID)
-    `UNUSED_VAR (reset)
+    `UNUSED_PARAM (CORE_ID)
+
+    reg [31:0] instr;
+    reg [31:0] pc;
+
+    always @(posedge clk) begin
+        if (fetch_if.valid && fetch_if.ready) begin
+             $display("%t: IFETCH: core%0d: PC=%h, instr=%h", $time, CORE_ID, fetch_if.data.PC, fetch_if.data.instr);
+        end
+    end
+
 
     wire icache_req_valid;
     wire [ICACHE_ADDR_WIDTH-1:0] icache_req_addr;

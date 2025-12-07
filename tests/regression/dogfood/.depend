@@ -1,4 +1,0 @@
-main.o: /home/yonghun/vortex/tests/regression/dogfood/main.cpp \
- /home/yonghun/vortex/runtime/include/vortex.h \
- /home/yonghun/vortex/tests/regression/dogfood/testcases.h \
- /home/yonghun/vortex/tests/regression/dogfood/common.h

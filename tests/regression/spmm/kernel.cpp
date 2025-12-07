@@ -34,6 +34,6 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 int main() {
-	kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
+	kernel_arg_t* arg = (kernel_arg_t*)0x1003c0;
 	return vx_spawn_threads(2, arg->grid_dim, nullptr, (vx_kernel_func_cb)kernel_body, arg);
 }

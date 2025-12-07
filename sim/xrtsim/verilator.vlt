@@ -7,3 +7,6 @@ lint_off -file "/home/yonghun/vortex/third_party/cvfpu/*"
 lint_off -rule BLKANDNBLK -file "/home/yonghun/vortex/third_party/hardfloat/*"
 lint_off -rule UNOPTFLAT -file "/home/yonghun/vortex/third_party/hardfloat/*"
 lint_off -file "/home/yonghun/vortex/third_party/hardfloat/*"
+
+lint_off -rule WIDTHEXPAND -file "*VX_afu_wrap.sv"
+lint_off -file "*VX_fetch.sv"

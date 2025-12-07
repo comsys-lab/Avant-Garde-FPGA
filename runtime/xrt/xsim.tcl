@@ -14,6 +14,9 @@
 # limitations under the License.
 #
 
+puts "DEBUG_XSIM: Handing over to AXI Force Script"
+# source "/home/yonghun/vortex/tests/regression/vecadd/axi_loader.tcl"
+
 log_wave -r *
 
 #open_vcd xsim_dump.vcd

@@ -197,7 +197,7 @@
 `endif
 
 `ifndef STARTUP_ADDR
-`define STARTUP_ADDR    32'h80000000
+`define STARTUP_ADDR    32'h00020000
 `endif
 
 `ifndef USER_BASE_ADDR

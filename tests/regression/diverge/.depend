@@ -1,3 +1,0 @@
-main.o: /home/yonghun/vortex/tests/regression/diverge/main.cpp \
- /home/yonghun/vortex/runtime/include/vortex.h \
- /home/yonghun/vortex/tests/regression/diverge/common.h

@@ -183,6 +183,9 @@ int main(int argc, char *argv[]) {
   // upload kernel argument
   std::cout << "upload kernel argument" << std::endl;
   RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
+  uint64_t dev_args;
+  RT_CHECK(vx_mem_address(args_buffer, &dev_args));
+  std::cout << "dev_args=0x" << std::hex << dev_args << std::endl;
 
   // start device
   std::cout << "start device" << std::endl;
