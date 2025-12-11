@@ -28,33 +28,39 @@ module tb_operand_transformer;
         $dumpvars(0, tb_operand_transformer);
     end
     
-    // Model Function for Expected Result Calculation
+    // Model Function for Expected Result Calculation (Sign-Magnitude)
     function logic [7:0] calc_expected(input logic [7:0] elem, input logic [7:0] scale);
-        logic [3:0] lead_one_pos;
+        logic       sign;
+        logic [6:0] mag;
+        logic [2:0] lead_one_pos;
         logic [15:0] target_msb_pos;
         
-        // 1. Find Leading One
-        if      (elem[7]) lead_one_pos = 7;
-        else if (elem[6]) lead_one_pos = 6;
-        else if (elem[5]) lead_one_pos = 5;
-        else if (elem[4]) lead_one_pos = 4;
-        else if (elem[3]) lead_one_pos = 3;
-        else if (elem[2]) lead_one_pos = 2;
-        else if (elem[1]) lead_one_pos = 1;
-        else if (elem[0]) lead_one_pos = 0;
-        else              return 8'd0; // Zero case
+        sign = elem[7];
+        mag  = elem[6:0];
+        
+        // 1. Find Leading One (Magnitude)
+        if      (mag[6]) lead_one_pos = 6;
+        else if (mag[5]) lead_one_pos = 5;
+        else if (mag[4]) lead_one_pos = 4;
+        else if (mag[3]) lead_one_pos = 3;
+        else if (mag[2]) lead_one_pos = 2;
+        else if (mag[1]) lead_one_pos = 1;
+        else if (mag[0]) lead_one_pos = 0;
+        else             return {sign, 7'd0}; // Zero Magnitude
 
         // 2. Calc Shift
-        target_msb_pos = {12'd0, lead_one_pos} + {8'd0, scale};
+        target_msb_pos = {13'd0, lead_one_pos} + {8'd0, scale};
 
-        // 3. Overflow Check
-        if (target_msb_pos > 7) begin
-            // MSB Aligned
-            return elem << (7 - lead_one_pos);
+        // 3. Overflow Check (Max Mag bit is 6)
+        if (target_msb_pos > 6) begin
+            // MSB Aligned to bit 6
+            mag = mag << (6 - lead_one_pos);
         end else begin
             // Normal Shift
-            return elem << scale;
+            mag = mag << scale;
         end
+        
+        return {sign, mag};
     endfunction
     
     // =========================================================================
@@ -72,9 +78,7 @@ module tb_operand_transformer;
         @(posedge clk);
         
         $display("\n========================================");
-        $display("Operand Transformer Test (Custom Pattern)");
-        $display("Elements: 1, 3, 7... 255 (Repeated)");
-        $display("Scales:   0, 0.. 1, 1.. 2, 2.. 3, 3..");
+        $display("Operand Transformer Test (Sign-Mag + Shift)");
         $display("========================================\n");
         
         // Mode 0 (1:2 Sharing)
@@ -82,27 +86,26 @@ module tb_operand_transformer;
         wait(ready_in);
         
         // -------------------------------------------------------------
-        // Setup Pattern
+        // Setup Pattern: Mixed Signs
         // -------------------------------------------------------------
         
-        // 1. Elements: 1, 3, 7, 15, 31, 63, 127, 255 (Repeated 4 times)
-        // Group of 8. 32 elements total.
+        // Elements: 
+        // 0-15: Positive {1, 3, 7, ...}
+        // 16-31: Negative {1, 3, 7, ...} (Set MSB)
         for (int i = 0; i < 32; i++) begin
             int val_idx = i % 8; // 0..7
-            // logic: 2^(idx+1) - 1
-            data_in.elements[i] = (1 << (val_idx + 1)) - 1;
+            logic [7:0] val = (1 << (val_idx + 1)) - 1; // 1, 3, 7...
+            
+            if (i >= 16) val[7] = 1; // Negative for upper half
+            
+            data_in.elements[i] = val;
         end
         
-        // 2. Scales: 
-        // Lanes 0-3  (Elems 0-7)   -> Scale 0
-        // Lanes 4-7  (Elems 8-15)  -> Scale 1
-        // Lanes 8-11 (Elems 16-23) -> Scale 2
-        // Lanes 12-15(Elems 24-31) -> Scale 3
+        // Scales: 
+        // Block of 4 uses 0, 1, 2, 3 repeated
         for (int lane = 0; lane < 16; lane++) begin
-            data_in.micro_scales[lane] = lane / 4;
+            data_in.micro_scales[lane] = lane / 4; 
         end
-        
-        $display("Input Setup Complete. Waiting for result...");
         
         // Send
         valid_in = 1;
@@ -111,13 +114,11 @@ module tb_operand_transformer;
         
         wait(valid_out);
         @(posedge clk);
-        @(posedge clk); // one extra cycle safe margin for read
         
         // Verify
         $display("\nCheck Results:");
         begin
             int fail_count = 0;
-            
             for (int i = 0; i < 32; i++) begin
                 int lane = i / 2;
                 logic [7:0] elem  = data_in.elements[i];
@@ -128,16 +129,16 @@ module tb_operand_transformer;
                 string status = (res === exp) ? "✓" : "✗";
                 if (res !== exp) fail_count++;
                 
-                $display("  Elem %2d (Lane %2d): E=%3d (0x%2h) S=%1d -> Exp %3d (0x%2h) Got %3d (0x%2h) %s", 
-                         i, lane, elem, elem, scale, exp, exp, res, res, status);
+                $display("  Elem %2d (S=%1d E=%3d): Scale %1d -> Exp 0x%2h Got 0x%2h %s", 
+                         i, elem[7], elem, scale, exp, res, status);
             end
             
             if (fail_count == 0)
-                $display("\nSUCCESS: All pattern checks passed!");
+                $display("\nSUCCESS: All mixed-sign checks passed!");
             else
                 $display("\nFAILURE: %0d mismatches found.", fail_count);
         end
-
+        
         ready_out = 1;
         @(posedge clk);
         ready_out = 0;

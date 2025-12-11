@@ -7,10 +7,13 @@ import operand_tf_pkg::*;
 // Purpose:
 //   Generic integer scaler for Operand Transformer.
 //   Computes: Result = Element << Scale (Element * 2^Scale)
-//   Output Handling:
-//     - Normal Case: Returns (Element << Scale)
-//     - Overflow Case: Returns MSB-Justified result (Preserves top 8 significant bits)
-//       (Equivalent to Floating Point Normalization + Exponent adjustment implicitly)
+//   Format: Assumes SIGN-MAGNITUDE (Bit 7 is Sign, Bits 6:0 are Magnitude)
+//   
+//   Logic:
+//     1. Preserve Sign Bit.
+//     2. Shift Magnitude (6:0) by Scale.
+//     3. Handle Overflow on Magnitude (MSB-Alignment).
+//     4. Output {Sign, Processed_Magnitude}.
 // =============================================================================
 
 module simple_multiplier (
@@ -18,45 +21,55 @@ module simple_multiplier (
     input  logic [7:0]     scale_in,
     output logic [7:0]     result_out
 );
-    logic [3:0] lead_one_pos; // 0..7
+    logic       sign_bit;
+    logic [6:0] magnitude_in;
+    logic [6:0] magnitude_out;
+    
+    logic [2:0] lead_one_pos; // 0..6 (Magnitude is 7 bits)
     logic       is_zero;
     
-    // 1. Leading One Detector for 8-bit input
+    // Split Input
+    assign sign_bit     = element_in[7];
+    assign magnitude_in = element_in[6:0];
+    
+    // 1. Leading One Detector for 7-bit Magnitude
     always_comb begin
         is_zero = 0;
-        if      (element_in[7]) lead_one_pos = 7;
-        else if (element_in[6]) lead_one_pos = 6;
-        else if (element_in[5]) lead_one_pos = 5;
-        else if (element_in[4]) lead_one_pos = 4;
-        else if (element_in[3]) lead_one_pos = 3;
-        else if (element_in[2]) lead_one_pos = 2;
-        else if (element_in[1]) lead_one_pos = 1;
-        else if (element_in[0]) lead_one_pos = 0;
+        if      (magnitude_in[6]) lead_one_pos = 6;
+        else if (magnitude_in[5]) lead_one_pos = 5;
+        else if (magnitude_in[4]) lead_one_pos = 4;
+        else if (magnitude_in[3]) lead_one_pos = 3;
+        else if (magnitude_in[2]) lead_one_pos = 2;
+        else if (magnitude_in[1]) lead_one_pos = 1;
+        else if (magnitude_in[0]) lead_one_pos = 0;
         else begin
             lead_one_pos = 0;
             is_zero = 1;
         end
     end
 
-    // 2. Shift Logic with MSB Alignment
+    // 2. Shift Logic with MSB Alignment (Magnitude Only)
     always_comb begin
         if (is_zero) begin
-            result_out = 8'd0;
+            magnitude_out = 7'd0;
         end else begin
             // Check potential MSB position after shift
-            // Use 16-bit to avoid overflow during check
+            // target_pos relative to bit 0 of magnitude. Max valid is 6.
             logic [15:0] target_msb_pos;
-            target_msb_pos = {12'd0, lead_one_pos} + {8'd0, scale_in};
+            target_msb_pos = {13'd0, lead_one_pos} + {8'd0, scale_in};
             
-            if (target_msb_pos > 7) begin
-                // Overflow Case: Align MSB to bit 7
-                // Shift element left by (7 - lead_one_pos)
-                result_out = element_in << (7 - lead_one_pos);
+            if (target_msb_pos > 6) begin
+                // Overflow Case: Align MSB to bit 6 (Top of Magnitude)
+                // Shift left by (6 - lead_one_pos)
+                magnitude_out = magnitude_in << (6 - lead_one_pos);
             end else begin
-                // Normal Case: Result fits in 8 bits
-                result_out = element_in << scale_in;
+                // Normal Case: Result fits in 7 bits
+                magnitude_out = magnitude_in << scale_in;
             end
         end
+        
+        // 3. Recombine
+        result_out = {sign_bit, magnitude_out};
     end
 
 endmodule

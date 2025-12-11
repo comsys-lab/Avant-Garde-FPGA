@@ -1,19 +1,20 @@
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/operand_transformer/rtl/operand_tf_pkg.sv" into library work
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/operand_transformer/rtl/simple_multiplier.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_tf_pkg.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/simple_multiplier.sv" into library work
 INFO: [VRFC 10-311] analyzing module simple_multiplier
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/operand_transformer/rtl/operand_tf_lane.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_tf_lane.sv" into library work
 INFO: [VRFC 10-311] analyzing module operand_tf_lane
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/operand_transformer/rtl/operand_transformer_ctrl.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_transformer_ctrl.sv" into library work
 INFO: [VRFC 10-311] analyzing module operand_transformer_ctrl
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/operand_transformer/rtl/operand_transformer.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_transformer.sv" into library work
 INFO: [VRFC 10-311] analyzing module operand_transformer
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv" into library work
 INFO: [VRFC 10-311] analyzing module tb_operand_transformer
-WARNING: [VRFC 10-3824] variable 'val_idx' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:91]
-WARNING: [VRFC 10-3824] variable 'fail_count' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:119]
-WARNING: [VRFC 10-3824] variable 'lane' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:122]
-WARNING: [VRFC 10-3824] variable 'elem' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:123]
-WARNING: [VRFC 10-3824] variable 'scale' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:124]
-WARNING: [VRFC 10-3824] variable 'res' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:125]
-WARNING: [VRFC 10-3824] variable 'exp' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:126]
-WARNING: [VRFC 10-3824] variable 'status' must explicitly be declared as automatic or static [/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv:128]
+WARNING: [VRFC 10-3824] variable 'val_idx' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:96]
+WARNING: [VRFC 10-3824] variable 'val' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:97]
+WARNING: [VRFC 10-3824] variable 'fail_count' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:121]
+WARNING: [VRFC 10-3824] variable 'lane' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:123]
+WARNING: [VRFC 10-3824] variable 'elem' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:124]
+WARNING: [VRFC 10-3824] variable 'scale' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:125]
+WARNING: [VRFC 10-3824] variable 'res' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:126]
+WARNING: [VRFC 10-3824] variable 'exp' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:127]
+WARNING: [VRFC 10-3824] variable 'status' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:129]

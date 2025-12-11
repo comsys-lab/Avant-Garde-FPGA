@@ -1,0 +1,63 @@
+#-----------------------------------------------------------
+# xsim v2023.1 (64-bit)
+# SW Build 3865809 on Sun May  7 15:04:56 MDT 2023
+# IP Build 3864474 on Sun May  7 20:36:21 MDT 2023
+# SharedData Build 3865790 on Sun May 07 13:33:03 MDT 2023
+# Start of session at: Thu Dec 11 22:45:09 2025
+# Process ID: 2130866
+# Current directory: /home/yonghun/vortex/operand_transformer/sim
+# Command line: xsim -mode tcl -source {xsim.dir/tb_snapshot/xsim_script.tcl}
+# Log file: /home/yonghun/vortex/operand_transformer/sim/xsim.log
+# Journal file: /home/yonghun/vortex/operand_transformer/sim/xsim.jou
+# Running On: comsys-u250, OS: Linux, CPU Frequency: 4909.366 MHz, CPU Physical cores: 10, Host memory: 134941 MB
+#-----------------------------------------------------------
+source xsim.dir/tb_snapshot/xsim_script.tcl
+# xsim {tb_snapshot} -autoloadwcfg -runall
+Time resolution is 1 ps
+run -all
+
+========================================
+Operand Transformer Test (Sign-Mag + Shift)
+========================================
+
+
+Check Results:
+  Elem  0 (S=0 E=  1): Scale 0 -> Exp 0x01 Got 0x01 ÿÿ“
+  Elem  1 (S=0 E=  3): Scale 0 -> Exp 0x03 Got 0x03 ÿÿ“
+  Elem  2 (S=0 E=  7): Scale 0 -> Exp 0x07 Got 0x07 ÿÿ“
+  Elem  3 (S=0 E= 15): Scale 0 -> Exp 0x0f Got 0x0f ÿÿ“
+  Elem  4 (S=0 E= 31): Scale 0 -> Exp 0x1f Got 0x1f ÿÿ“
+  Elem  5 (S=0 E= 63): Scale 0 -> Exp 0x3f Got 0x3f ÿÿ“
+  Elem  6 (S=0 E=127): Scale 0 -> Exp 0x7f Got 0x7f ÿÿ“
+  Elem  7 (S=1 E=255): Scale 0 -> Exp 0xff Got 0xff ÿÿ“
+  Elem  8 (S=0 E=  1): Scale 1 -> Exp 0x02 Got 0x02 ÿÿ“
+  Elem  9 (S=0 E=  3): Scale 1 -> Exp 0x06 Got 0x06 ÿÿ“
+  Elem 10 (S=0 E=  7): Scale 1 -> Exp 0x0e Got 0x0e ÿÿ“
+  Elem 11 (S=0 E= 15): Scale 1 -> Exp 0x1e Got 0x1e ÿÿ“
+  Elem 12 (S=0 E= 31): Scale 1 -> Exp 0x3e Got 0x3e ÿÿ“
+  Elem 13 (S=0 E= 63): Scale 1 -> Exp 0x7e Got 0x7e ÿÿ“
+  Elem 14 (S=0 E=127): Scale 1 -> Exp 0x7f Got 0x7f ÿÿ“
+  Elem 15 (S=1 E=255): Scale 1 -> Exp 0xff Got 0xff ÿÿ“
+  Elem 16 (S=1 E=129): Scale 2 -> Exp 0x84 Got 0x84 ÿÿ“
+  Elem 17 (S=1 E=131): Scale 2 -> Exp 0x8c Got 0x8c ÿÿ“
+  Elem 18 (S=1 E=135): Scale 2 -> Exp 0x9c Got 0x9c ÿÿ“
+  Elem 19 (S=1 E=143): Scale 2 -> Exp 0xbc Got 0xbc ÿÿ“
+  Elem 20 (S=1 E=159): Scale 2 -> Exp 0xfc Got 0xfc ÿÿ“
+  Elem 21 (S=1 E=191): Scale 2 -> Exp 0xfe Got 0xfe ÿÿ“
+  Elem 22 (S=1 E=255): Scale 2 -> Exp 0xff Got 0xff ÿÿ“
+  Elem 23 (S=1 E=255): Scale 2 -> Exp 0xff Got 0xff ÿÿ“
+  Elem 24 (S=1 E=129): Scale 3 -> Exp 0x88 Got 0x88 ÿÿ“
+  Elem 25 (S=1 E=131): Scale 3 -> Exp 0x98 Got 0x98 ÿÿ“
+  Elem 26 (S=1 E=135): Scale 3 -> Exp 0xb8 Got 0xb8 ÿÿ“
+  Elem 27 (S=1 E=143): Scale 3 -> Exp 0xf8 Got 0xf8 ÿÿ“
+  Elem 28 (S=1 E=159): Scale 3 -> Exp 0xfc Got 0xfc ÿÿ“
+  Elem 29 (S=1 E=191): Scale 3 -> Exp 0xfe Got 0xfe ÿÿ“
+  Elem 30 (S=1 E=255): Scale 3 -> Exp 0xff Got 0xff ÿÿ“
+  Elem 31 (S=1 E=255): Scale 3 -> Exp 0xff Got 0xff ÿÿ“
+
+SUCCESS: All mixed-sign checks passed!
+
+Test Complete!
+$finish called at time : 195 ns : File "/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv" Line 148
+exit
+INFO: [Common 17-206] Exiting xsim at Thu Dec 11 22:45:12 2025...

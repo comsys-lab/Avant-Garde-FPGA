@@ -3,13 +3,14 @@
 # SW Build 3865809 on Sun May  7 15:04:56 MDT 2023
 # IP Build 3864474 on Sun May  7 20:36:21 MDT 2023
 # SharedData Build 3865790 on Sun May 07 13:33:03 MDT 2023
-# Start of session at: Thu Dec 11 22:45:27 2025
-# Process ID: 2131340
+# Start of session at: Thu Dec 11 22:37:47 2025
+# Process ID: 2123359
 # Current directory: /home/yonghun/vortex/operand_transformer/sim
 # Command line: xsim -source {xsim.dir/tb_snapshot/xsim_script.tcl}
 # Log file: /home/yonghun/vortex/operand_transformer/sim/xsim.log
 # Journal file: /home/yonghun/vortex/operand_transformer/sim/xsim.jou
-# Running On: comsys-u250, OS: Linux, CPU Frequency: 4906.375 MHz, CPU Physical cores: 10, Host memory: 134941 MB
+# Running On: comsys-u250, OS: Linux, CPU Frequency: 5001.220 MHz, CPU Physical cores: 10, Host memory: 134941 MB
 #-----------------------------------------------------------
 start_gui
 source xsim.dir/tb_snapshot/xsim_script.tcl
+close_sim

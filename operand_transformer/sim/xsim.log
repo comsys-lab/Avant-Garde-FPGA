@@ -3,13 +3,13 @@
 # SW Build 3865809 on Sun May  7 15:04:56 MDT 2023
 # IP Build 3864474 on Sun May  7 20:36:21 MDT 2023
 # SharedData Build 3865790 on Sun May 07 13:33:03 MDT 2023
-# Start of session at: Thu Dec 11 21:52:09 2025
-# Process ID: 2076089
-# Current directory: /home/yonghun/operand_transformer/sim
+# Start of session at: Thu Dec 11 22:45:27 2025
+# Process ID: 2131340
+# Current directory: /home/yonghun/vortex/operand_transformer/sim
 # Command line: xsim -source {xsim.dir/tb_snapshot/xsim_script.tcl}
-# Log file: /home/yonghun/operand_transformer/sim/xsim.log
-# Journal file: /home/yonghun/operand_transformer/sim/xsim.jou
-# Running On: comsys-u250, OS: Linux, CPU Frequency: 4906.446 MHz, CPU Physical cores: 10, Host memory: 134941 MB
+# Log file: /home/yonghun/vortex/operand_transformer/sim/xsim.log
+# Journal file: /home/yonghun/vortex/operand_transformer/sim/xsim.jou
+# Running On: comsys-u250, OS: Linux, CPU Frequency: 4906.375 MHz, CPU Physical cores: 10, Host memory: 134941 MB
 #-----------------------------------------------------------
 start_gui
 source xsim.dir/tb_snapshot/xsim_script.tcl
@@ -67,59 +67,3 @@ WARNING: [Board 49-26] cannot add Board Part xilinx.com:zcu670ld:part0:1.0 avail
 INFO: [IP_Flow 19-234] Refreshing IP repositories
 INFO: [IP_Flow 19-1704] No user IP repositories specified
 INFO: [IP_Flow 19-2313] Loaded Vivado IP repository '/opt/xilinx/Vivado/2023.1/data/ip'.
-current_fileset: Time (s): cpu = 00:00:10 ; elapsed = 00:00:06 . Memory (MB): peak = 12453.184 ; gain = 274.066 ; free physical = 32966 ; free virtual = 108827
-# xsim {tb_snapshot} -autoloadwcfg
-Time resolution is 1 ps
-create_wave_config; add_wave /; set_property needs_save false [current_wave_config]
-run all
-
-========================================
-Operand Transformer Test (Custom Pattern)
-Elements: 1, 3, 7... 255 (Repeated)
-Scales:   0, 0.. 1, 1.. 2, 2.. 3, 3..
-========================================
-
-Input Setup Complete. Waiting for result...
-
-Check Results:
-  Elem  0 (Lane  0): E=  1 (0x01) S=0 -> Exp   1 (0x01) Got   1 (0x01) ÿÿ“
-  Elem  1 (Lane  0): E=  3 (0x03) S=0 -> Exp   3 (0x03) Got   3 (0x03) ÿÿ“
-  Elem  2 (Lane  1): E=  7 (0x07) S=0 -> Exp   7 (0x07) Got   7 (0x07) ÿÿ“
-  Elem  3 (Lane  1): E= 15 (0x0f) S=0 -> Exp  15 (0x0f) Got  15 (0x0f) ÿÿ“
-  Elem  4 (Lane  2): E= 31 (0x1f) S=0 -> Exp  31 (0x1f) Got  31 (0x1f) ÿÿ“
-  Elem  5 (Lane  2): E= 63 (0x3f) S=0 -> Exp  63 (0x3f) Got  63 (0x3f) ÿÿ“
-  Elem  6 (Lane  3): E=127 (0x7f) S=0 -> Exp 127 (0x7f) Got 127 (0x7f) ÿÿ“
-  Elem  7 (Lane  3): E=255 (0xff) S=0 -> Exp 255 (0xff) Got 255 (0xff) ÿÿ“
-  Elem  8 (Lane  4): E=  1 (0x01) S=1 -> Exp   2 (0x02) Got   2 (0x02) ÿÿ“
-  Elem  9 (Lane  4): E=  3 (0x03) S=1 -> Exp   6 (0x06) Got   6 (0x06) ÿÿ“
-  Elem 10 (Lane  5): E=  7 (0x07) S=1 -> Exp  14 (0x0e) Got  14 (0x0e) ÿÿ“
-  Elem 11 (Lane  5): E= 15 (0x0f) S=1 -> Exp  30 (0x1e) Got  30 (0x1e) ÿÿ“
-  Elem 12 (Lane  6): E= 31 (0x1f) S=1 -> Exp  62 (0x3e) Got  62 (0x3e) ÿÿ“
-  Elem 13 (Lane  6): E= 63 (0x3f) S=1 -> Exp 126 (0x7e) Got 126 (0x7e) ÿÿ“
-  Elem 14 (Lane  7): E=127 (0x7f) S=1 -> Exp 254 (0xfe) Got 254 (0xfe) ÿÿ“
-  Elem 15 (Lane  7): E=255 (0xff) S=1 -> Exp 255 (0xff) Got 255 (0xff) ÿÿ“
-  Elem 16 (Lane  8): E=  1 (0x01) S=2 -> Exp   4 (0x04) Got   4 (0x04) ÿÿ“
-  Elem 17 (Lane  8): E=  3 (0x03) S=2 -> Exp  12 (0x0c) Got  12 (0x0c) ÿÿ“
-  Elem 18 (Lane  9): E=  7 (0x07) S=2 -> Exp  28 (0x1c) Got  28 (0x1c) ÿÿ“
-  Elem 19 (Lane  9): E= 15 (0x0f) S=2 -> Exp  60 (0x3c) Got  60 (0x3c) ÿÿ“
-  Elem 20 (Lane 10): E= 31 (0x1f) S=2 -> Exp 124 (0x7c) Got 124 (0x7c) ÿÿ“
-  Elem 21 (Lane 10): E= 63 (0x3f) S=2 -> Exp 252 (0xfc) Got 252 (0xfc) ÿÿ“
-  Elem 22 (Lane 11): E=127 (0x7f) S=2 -> Exp 254 (0xfe) Got 254 (0xfe) ÿÿ“
-  Elem 23 (Lane 11): E=255 (0xff) S=2 -> Exp 255 (0xff) Got 255 (0xff) ÿÿ“
-  Elem 24 (Lane 12): E=  1 (0x01) S=3 -> Exp   8 (0x08) Got   8 (0x08) ÿÿ“
-  Elem 25 (Lane 12): E=  3 (0x03) S=3 -> Exp  24 (0x18) Got  24 (0x18) ÿÿ“
-  Elem 26 (Lane 13): E=  7 (0x07) S=3 -> Exp  56 (0x38) Got  56 (0x38) ÿÿ“
-  Elem 27 (Lane 13): E= 15 (0x0f) S=3 -> Exp 120 (0x78) Got 120 (0x78) ÿÿ“
-  Elem 28 (Lane 14): E= 31 (0x1f) S=3 -> Exp 248 (0xf8) Got 248 (0xf8) ÿÿ“
-  Elem 29 (Lane 14): E= 63 (0x3f) S=3 -> Exp 252 (0xfc) Got 252 (0xfc) ÿÿ“
-  Elem 30 (Lane 15): E=127 (0x7f) S=3 -> Exp 254 (0xfe) Got 254 (0xfe) ÿÿ“
-  Elem 31 (Lane 15): E=255 (0xff) S=3 -> Exp 255 (0xff) Got 255 (0xff) ÿÿ“
-
-SUCCESS: All pattern checks passed!
-
-Test Complete!
-$finish called at time : 205 ns : File "/home/yonghun/operand_transformer/tb/tb_operand_transformer.sv" Line 147
-close_sim
-INFO: [Simtcl 6-16] Simulation closed
-exit
-INFO: [Common 17-206] Exiting xsim at Thu Dec 11 22:00:22 2025...

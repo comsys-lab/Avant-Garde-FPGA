@@ -4,7 +4,7 @@
 
 ### 1. Run Synthesis and Open Schematic
 ```bash
-cd /home/yonghun/operand_transformer/synthesis
+cd /home/yonghun/vortex/operand_transformer/synthesis
 make synth
 ```
 
