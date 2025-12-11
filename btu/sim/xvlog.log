@@ -1,7 +1,0 @@
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/btu/rtl/btu_pkg.sv" into library work
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/btu/rtl/btu_sub_unit.sv" into library work
-INFO: [VRFC 10-311] analyzing module btu_sub_unit
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/btu/rtl/btu_top.sv" into library work
-INFO: [VRFC 10-311] analyzing module btu_top
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/btu/tb/tb_btu.sv" into library work
-INFO: [VRFC 10-311] analyzing module tb_btu

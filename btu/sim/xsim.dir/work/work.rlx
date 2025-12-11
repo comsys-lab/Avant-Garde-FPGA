@@ -1,8 +1,0 @@
-0.7
-2020.2
-May  7 2023
-15:10:42
-/home/yonghun/btu/rtl/btu_pkg.sv,1765286302,systemVerilog,/home/yonghun/btu/rtl/btu_sub_unit.sv;/home/yonghun/btu/rtl/btu_top.sv;/home/yonghun/btu/tb/tb_btu.sv,/home/yonghun/btu/rtl/btu_sub_unit.sv,,$unit_btu_pkg_sv_566929782;btu_pkg,,,,,,,,
-/home/yonghun/btu/rtl/btu_sub_unit.sv,1765280621,systemVerilog,,/home/yonghun/btu/rtl/btu_top.sv,,btu_sub_unit,,,,,,,,
-/home/yonghun/btu/rtl/btu_top.sv,1765284509,systemVerilog,,/home/yonghun/btu/tb/tb_btu.sv,,btu_top,,,,,,,,
-/home/yonghun/btu/tb/tb_btu.sv,1765457913,systemVerilog,,,,tb_btu,,,,,,,,
