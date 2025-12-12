@@ -29,11 +29,7 @@ module VX_dcr_data import VX_gpu_pkg::*; (
     base_dcrs_t dcrs;
 
     always @(posedge clk) begin
-        if (reset) begin
-            dcrs.startup_addr <= `STARTUP_ADDR;
-            dcrs.startup_arg  <= '0;
-            dcrs.mpm_class    <= '0;
-        end else if (dcr_bus_if.write_valid) begin
+        if (dcr_bus_if.write_valid) begin
             case (dcr_bus_if.write_addr)
             `VX_DCR_BASE_STARTUP_ADDR0 : dcrs.startup_addr[31:0] <= dcr_bus_if.write_data;
         `ifdef XLEN_64
@@ -47,6 +43,11 @@ module VX_dcr_data import VX_gpu_pkg::*; (
             default:;
             endcase
         end
+    end
+    
+    // Ensure startup_arg is initialized to 0 to avoid X
+    initial begin
+        dcrs.startup_arg = 0;
     end
 
     assign base_dcrs = dcrs;

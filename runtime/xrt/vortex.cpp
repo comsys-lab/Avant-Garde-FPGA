@@ -347,17 +347,12 @@ public:
       return err;
     });
     // Return physical address by adding Bank 0 base
-    *dev_addr = addr + 0x4000000000;
+    *dev_addr = addr;
     return 0;
   }
 
   int mem_reserve(uint64_t dev_addr, uint64_t size, int flags) {
-    // Strip Bank 0 base address to get local address
-    const uint64_t BANK0_BASE = 0x4000000000;
     uint64_t local_addr = dev_addr;
-    if (dev_addr >= BANK0_BASE) {
-      local_addr = dev_addr - BANK0_BASE;
-    }
     CHECK_ERR(global_mem_.reserve(local_addr, size), {
       return err;
     });
@@ -383,9 +378,6 @@ public:
     // Strip Bank 0 base address to get local address
     const uint64_t BANK0_BASE = 0x4000000000;
     uint64_t local_addr = dev_addr;
-    if (dev_addr >= BANK0_BASE) {
-      local_addr = dev_addr - BANK0_BASE;
-    }
     CHECK_ERR(global_mem_.release(local_addr), {
       return err;
     });
@@ -472,12 +464,7 @@ public:
         return 0; // Return success immediately
     }
 
-    // Strip Bank 0 base address to get local address
-    const uint64_t BANK0_BASE = 0x4000000000;
     uint64_t local_addr = dev_addr;
-    if (dev_addr >= BANK0_BASE) {
-      local_addr = dev_addr - BANK0_BASE;
-    }
 
     auto asize = aligned_size(size, CACHE_BLOCK_SIZE);
     uint64_t dev_addr_start = local_addr;
@@ -570,12 +557,7 @@ public:
     if (!is_aligned(dev_addr, CACHE_BLOCK_SIZE))
       return -1;
 
-    // Strip Bank 0 base address to get local address
-    const uint64_t BANK0_BASE = 0x4000000000;
     uint64_t local_addr = dev_addr;
-    if (dev_addr >= BANK0_BASE) {
-      local_addr = dev_addr - BANK0_BASE;
-    }
 
     auto asize = aligned_size(size, CACHE_BLOCK_SIZE);
 
@@ -818,12 +800,11 @@ private:
       return -1;
     }
     if (pIdx) {
-      *pIdx = index;
+      *pIdx = 1; // Force Bank 1 matching xclbin topology
     }
     if (pOff) {
       *pOff = offset;
     }
-    //printf("get_bank_info(addr=0x%lx, bank=%d, offset=0x%lx\n", addr, index, offset);
     return 0;
   }
 
