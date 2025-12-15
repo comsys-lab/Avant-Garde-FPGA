@@ -14,7 +14,7 @@ RTL_SRCS = $(RTL_DIR)/operand_tf_pkg.sv \
            $(RTL_DIR)/simple_multiplier.sv \
            $(RTL_DIR)/operand_tf_lane.sv \
            $(RTL_DIR)/operand_transformer_ctrl.sv \
-           $(RTL_DIR)/operand_transformer.sv
+           $(RTL_DIR)/operand_transformer_top.sv
 
 TB_SRCS  = $(TB_DIR)/tb_operand_transformer.sv
 TOP_MOD  = tb_operand_transformer

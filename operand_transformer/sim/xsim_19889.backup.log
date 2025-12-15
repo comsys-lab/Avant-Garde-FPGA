@@ -3,13 +3,13 @@
 # SW Build 3865809 on Sun May  7 15:04:56 MDT 2023
 # IP Build 3864474 on Sun May  7 20:36:21 MDT 2023
 # SharedData Build 3865790 on Sun May 07 13:33:03 MDT 2023
-# Start of session at: Mon Dec 15 16:57:30 2025
-# Process ID: 78444
+# Start of session at: Fri Dec 12 14:08:18 2025
+# Process ID: 19889
 # Current directory: /home/yonghun/vortex/operand_transformer/sim
 # Command line: xsim -mode tcl -source {xsim.dir/tb_snapshot/xsim_script.tcl}
 # Log file: /home/yonghun/vortex/operand_transformer/sim/xsim.log
 # Journal file: /home/yonghun/vortex/operand_transformer/sim/xsim.jou
-# Running On: comsys-u250, OS: Linux, CPU Frequency: 4972.733 MHz, CPU Physical cores: 10, Host memory: 134941 MB
+# Running On: comsys-u250, OS: Linux, CPU Frequency: 4978.203 MHz, CPU Physical cores: 10, Host memory: 134941 MB
 #-----------------------------------------------------------
 source xsim.dir/tb_snapshot/xsim_script.tcl
 # xsim {tb_snapshot} -autoloadwcfg -runall
@@ -58,6 +58,6 @@ Check Results:
 SUCCESS: All mixed-sign checks passed!
 
 Test Complete!
-$finish called at time : 185 ns : File "/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv" Line 148
+$finish called at time : 195 ns : File "/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv" Line 148
 exit
-INFO: [Common 17-206] Exiting xsim at Mon Dec 15 16:57:32 2025...
+INFO: [Common 17-206] Exiting xsim at Fri Dec 12 14:08:22 2025...

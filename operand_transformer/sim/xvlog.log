@@ -5,8 +5,8 @@ INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_
 INFO: [VRFC 10-311] analyzing module operand_tf_lane
 INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_transformer_ctrl.sv" into library work
 INFO: [VRFC 10-311] analyzing module operand_transformer_ctrl
-INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_transformer.sv" into library work
-INFO: [VRFC 10-311] analyzing module operand_transformer
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/rtl/operand_transformer_top.sv" into library work
+INFO: [VRFC 10-311] analyzing module operand_transformer_top
 INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv" into library work
 INFO: [VRFC 10-311] analyzing module tb_operand_transformer
 WARNING: [VRFC 10-3824] variable 'val_idx' must explicitly be declared as automatic or static [/home/yonghun/vortex/operand_transformer/tb/tb_operand_transformer.sv:96]

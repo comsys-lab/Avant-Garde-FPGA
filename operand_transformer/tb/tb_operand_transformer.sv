@@ -14,7 +14,7 @@ module tb_operand_transformer;
     operand_output_t     data_out;
     
     // DUT Instance
-    operand_transformer dut (.*);
+    operand_transformer_top dut (.*);
     
     // Clock Generation
     initial begin

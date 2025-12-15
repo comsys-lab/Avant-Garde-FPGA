@@ -14,6 +14,6 @@ Compiling package work.operand_tf_pkg
 Compiling module work.operand_transformer_ctrl
 Compiling module work.simple_multiplier
 Compiling module work.operand_tf_lane
-Compiling module work.operand_transformer_default
+Compiling module work.operand_transformer_top_default
 Compiling module work.tb_operand_transformer
 Built simulation snapshot tb_snapshot

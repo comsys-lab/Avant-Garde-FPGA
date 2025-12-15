@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 import operand_tf_pkg::*;
 
-module operand_transformer (
+module operand_transformer_top (
     input  logic             clk,
     input  logic             rst_n,
     input  logic             valid_in,
@@ -13,7 +13,7 @@ module operand_transformer (
 );
 
     // Control signals
-    logic load_input, we_temp_reg, use_odd, we_output_reg;
+    logic load_input, we_temp_reg, use_odd, we_output_reg, feedback_sel;
     
     operand_transformer_ctrl u_ctrl (
         .clk(clk), .rst_n(rst_n),
@@ -22,7 +22,7 @@ module operand_transformer (
         .load_input(load_input),
         .we_temp_reg(we_temp_reg),
         .use_odd(use_odd),
-        .we_output_reg(we_output_reg)
+        .feedback_sel(feedback_sel)
     );
 
     // Lane results (Temporal Registers)
@@ -59,6 +59,7 @@ module operand_transformer (
                 .clk(clk), .rst_n(rst_n),
                 .load_input(load_input),
                 .iter_sel(use_odd),
+                .feedback_sel(feedback_sel),
                 .we_result(we_temp_reg),
                 // Elements: 2 per lane (0/1, 2/3, ...)
                 .elem_0_in(data_in.elements[2*i]),
@@ -74,16 +75,12 @@ module operand_transformer (
 
     // Output Mapping with Synchronization Register
     // Ensures all 32 elements appear simultaneously at the output port
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            data_out.flattened_elements <= '0;
-        end else if (we_output_reg) begin
-            // Update output exactly when processing finishes (PROCESS_ODD end)
-            // This ensures data is valid immediately when valid_out goes high next cycle
-            for (int j = 0; j < 16; j++) begin
-                data_out.flattened_elements[2*j]   <= lane_res_even[j];
-                data_out.flattened_elements[2*j+1] <= lane_res_odd[j];
-            end
+    // Output Mapping (Direct Wire)
+    // Lane Temporal Registers hold valid data during DONE_WAIT state
+    always_comb begin
+        for (int j = 0; j < 16; j++) begin
+            data_out.flattened_elements[2*j]   = lane_res_even[j];
+            data_out.flattened_elements[2*j+1] = lane_res_odd[j];
         end
     end
 

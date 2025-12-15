@@ -35,7 +35,7 @@ Java maximum memory (-Xmx):	 3 GB
 
 User name: 	yonghun
 User home directory: /home/yonghun
-User working directory: /home/yonghun/operand_transformer/sim
+User working directory: /home/yonghun/vortex/operand_transformer/sim
 User country: 	US
 User language: 	en
 User locale: 	en_US
@@ -49,8 +49,8 @@ Vivado preferences file: /home/yonghun/.Xilinx/xsim/2023.1/vivado.xml
 Vivado preferences directory: /home/yonghun/.Xilinx/xsim/2023.1/
 Vivado layouts directory: /home/yonghun/.Xilinx/xsim/2023.1/data/layouts
 PlanAhead jar file: 	/opt/xilinx/Vivado/2023.1/lib/classes/planAhead.jar
-Vivado log file: 	/home/yonghun/operand_transformer/sim/xsim.log
-Vivado journal file: 	/home/yonghun/operand_transformer/sim/xsim.jou
+Vivado log file: 	/home/yonghun/vortex/operand_transformer/sim/xsim.log
+Vivado journal file: 	/home/yonghun/vortex/operand_transformer/sim/xsim.jou
 Engine tmp dir: 	./.Xil/xsim-1633487-comsys-u250
 Non-Default Parameters:	[]
 
@@ -71,7 +71,7 @@ RDI_PATCHROOT:
 RDI_PLATFORM: lnx64
 RDI_PREPEND_PATH: /opt/xilinx/Vitis/2023.1/bin
 RDI_PROG: /opt/xilinx/Vivado/2023.1/bin/unwrapped/lnx64.o/xsim
-RDI_SESSION_INFO: /home/yonghun/operand_transformer/sim:comsys-u250_1765444893_1633447
+RDI_SESSION_INFO: /home/yonghun/vortex/operand_transformer/sim:comsys-u250_1765444893_1633447
 RDI_SHARED_DATA: /opt/xilinx/SharedData/2023.1/data
 RDI_TPS_ROOT: /opt/xilinx/Vivado/2023.1/tps/lnx64
 RDI_USE_JDK17: 1

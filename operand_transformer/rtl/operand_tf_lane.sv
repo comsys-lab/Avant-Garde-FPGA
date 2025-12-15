@@ -17,6 +17,7 @@ module operand_tf_lane (
     // Control
     input  logic                      load_input,
     input  logic                      iter_sel,      // 0=Even pass, 1=Odd pass
+    input  logic                      feedback_sel,  // 0=Input Buffer, 1=Feedback
     input  logic                      we_result,     // Write Enable for Result
     
     // Data
@@ -48,10 +49,19 @@ module operand_tf_lane (
     end
 
     // =========================================================================
-    // 2. Input Mux (Select Even/Odd)
+    // 2. Input Mux (Select Even/Odd & Input/Feedback)
     // =========================================================================
     logic [ELEM_WIDTH_IN-1:0] mux_elem;
-    assign mux_elem = iter_sel ? elem_1_buf : elem_0_buf;
+    
+    always_comb begin
+        case ({feedback_sel, iter_sel})
+            2'b00: mux_elem = elem_0_buf;  // Load Even
+            2'b01: mux_elem = elem_1_buf;  // Load Odd
+            2'b10: mux_elem = res_0_out;   // Feedback Even
+            2'b11: mux_elem = res_1_out;   // Feedback Odd
+            default: mux_elem = elem_0_buf;
+        endcase
+    end
 
     // =========================================================================
     // 3. Multiplier (Element × Micro Scale)

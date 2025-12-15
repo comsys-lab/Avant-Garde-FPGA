@@ -3,13 +3,16 @@
 # SW Build 3865809 on Sun May  7 15:04:56 MDT 2023
 # IP Build 3864474 on Sun May  7 20:36:21 MDT 2023
 # SharedData Build 3865790 on Sun May 07 13:33:03 MDT 2023
-# Start of session at: Mon Dec 15 16:57:30 2025
-# Process ID: 78444
+# Start of session at: Thu Dec 11 22:45:27 2025
+# Process ID: 2131340
 # Current directory: /home/yonghun/vortex/operand_transformer/sim
-# Command line: xsim -mode tcl -source {xsim.dir/tb_snapshot/xsim_script.tcl}
+# Command line: xsim -source {xsim.dir/tb_snapshot/xsim_script.tcl}
 # Log file: /home/yonghun/vortex/operand_transformer/sim/xsim.log
 # Journal file: /home/yonghun/vortex/operand_transformer/sim/xsim.jou
-# Running On: comsys-u250, OS: Linux, CPU Frequency: 4972.733 MHz, CPU Physical cores: 10, Host memory: 134941 MB
+# Running On: comsys-u250, OS: Linux, CPU Frequency: 4906.375 MHz, CPU Physical cores: 10, Host memory: 134941 MB
 #-----------------------------------------------------------
+start_gui
 source xsim.dir/tb_snapshot/xsim_script.tcl
-run -all
+create_wave_config; add_wave /; set_property needs_save false [current_wave_config]
+run all
+close_sim

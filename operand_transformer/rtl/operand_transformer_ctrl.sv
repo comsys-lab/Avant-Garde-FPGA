@@ -16,8 +16,11 @@ module operand_transformer_ctrl (
     output logic load_input,
     output logic use_odd, // 0: Even (0,2..), 1: Odd (1,3..)
     output logic we_temp_reg,
-    output logic we_output_reg // New signal for output synchronization logic
+    output logic feedback_sel   // Select Feedback path
 );
+
+    // Default Feedback to 0 (No L3 scaling yet)
+    assign feedback_sel = 1'b0;
 
     // FSM States
     // Implements Avant-Garde's two-pass operand flattening:
@@ -28,7 +31,6 @@ module operand_transformer_ctrl (
         IDLE,
         PROCESS_EVEN,  // Process even indices
         PROCESS_ODD,   // Process odd indices
-        LATCH_OUTPUT,  // Latch final results to output register
         DONE_WAIT      // Wait for output handshake
     } state_t;
 
@@ -56,9 +58,7 @@ module operand_transformer_ctrl (
             end
             PROCESS_ODD: begin
                 // One cycle to latch result of odd set
-                next_state = LATCH_OUTPUT;
-            end
-            LATCH_OUTPUT: begin
+                // Direct Transition to DONE_WAIT (Output wired to Temp Regs)
                 next_state = DONE_WAIT;
             end
             DONE_WAIT: begin
@@ -77,7 +77,6 @@ module operand_transformer_ctrl (
         load_input    = 0;
         use_odd       = 0;
         we_temp_reg   = 0;
-        we_output_reg = 0;
 
         case (state)
             IDLE: begin
@@ -96,9 +95,6 @@ module operand_transformer_ctrl (
                 // Select Odd inputs
                 use_odd = 1;
                 we_temp_reg    = 1;
-            end
-            LATCH_OUTPUT: begin
-                we_output_reg  = 1;
             end
             DONE_WAIT: begin
                 valid_out = 1;
