@@ -512,10 +512,10 @@ public:
       std::memcpy(ptr + bo_offset, host_ptr, CACHE_BLOCK_SIZE);
       
       uint64_t phys_addr = xrtBuffer.address();
-      fprintf(stderr, "DEBUG: CPP_API upload bo_offset=0x%lx, xrtBOAddress=0x%lx\n", bo_offset, phys_addr);
+
 
       xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, CACHE_BLOCK_SIZE, bo_offset);
-      fprintf(stderr, "DEBUG: CPP_API upload sync complete\n");
+
     #else
       // Dual Write Strategy
       uint64_t bo_offset_secondary = bo_offset + 0x44A00000;
