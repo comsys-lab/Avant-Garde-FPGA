@@ -4,6 +4,8 @@ TARGET ?= xrt
 
 XRT_SYN_DIR ?= $(VORTEX_HOME)/hw/syn/xilinx/xrt
 XRT_DEVICE_INDEX ?= 0
+PLATFORM ?= xilinx_u250_gen3x16_xdma_4_1_202210_1
+FPGA_BIN_DIR := $(XRT_SYN_DIR)/build$(XLEN)_$(PLATFORM)_$(TARGET)/bin
 
 VORTEX_RT_PATH ?= $(ROOT_DIR)/runtime
 #VORTEX_RT_PATH ?= $(ROOT_DIR)/build/runtime

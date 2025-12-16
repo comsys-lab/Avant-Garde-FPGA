@@ -142,9 +142,19 @@ main() {
         exit $?
     fi
 
-    if [ -n "$CONFIGS" ]; then
-        echo "CONFIGS=$CONFIGS"
-    fi
+    	if [[ -z "$FPGA_BIN_DIR" ]]; then
+		# Try to detect FPGA_BIN_DIR for hw_emu
+		if [[ "$TARGET" == "hw_emu" ]]; then
+			FPGA_BIN_DIR=$(find $ROOT_DIR/hw/syn/xilinx/xrt -name "bin" -type d | grep "_hw_emu" | head -n 1)
+			if [[ -z "$FPGA_BIN_DIR" ]]; then
+				echo "Error: FPGA_BIN_DIR not set and cannot be auto-detected for hw_emu"
+				exit 1
+			fi
+		else
+			echo "Error: FPGA_BIN_DIR not set"
+			exit 1
+		fi
+	fi
 
     export VORTEX_PROFILING=$PERF_CLASS
 

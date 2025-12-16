@@ -128,6 +128,7 @@ endif
 
 ifeq ($(TARGET), hw_emu)
 	CFLAGS += -DSIMULATION
+	VPP_FLAGS += --define SIMULATION=1
 endif
 
 # Debugging

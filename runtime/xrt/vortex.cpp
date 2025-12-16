@@ -800,7 +800,7 @@ private:
       return -1;
     }
     if (pIdx) {
-      *pIdx = 1; // Force Bank 1 matching xclbin topology
+      *pIdx = index;
     }
     if (pOff) {
       *pOff = offset;

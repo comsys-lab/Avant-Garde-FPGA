@@ -295,7 +295,11 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     // Force offset for debugging (Bank 1 Base Address)
     // Force offset for debugging (Bank 0 Base Address)
     // connectivity.cfg now forces all memory to DDR[0] (0x4000000000)
+    `ifdef SIMULATION
+    localparam [C_M_AXI_MEM_ADDR_WIDTH-1:0] AXI_MEM_OFFSET = 64'h0;
+    `else
     localparam [C_M_AXI_MEM_ADDR_WIDTH-1:0] AXI_MEM_OFFSET = 64'h5000000000;
+    `endif
 		assign m_axi_mem_awaddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_awaddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(0) + AXI_MEM_OFFSET;
 		assign m_axi_mem_araddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_araddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(0) + AXI_MEM_OFFSET;
 	end
