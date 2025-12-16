@@ -376,7 +376,7 @@ public:
 
   int mem_free(uint64_t dev_addr) {
     // Strip Bank 0 base address to get local address
-    const uint64_t BANK0_BASE = 0x4000000000;
+
     uint64_t local_addr = dev_addr;
     CHECK_ERR(global_mem_.release(local_addr), {
       return err;
@@ -511,7 +511,7 @@ public:
       auto ptr = (uint8_t*)xrtBuffer.map();
       std::memcpy(ptr + bo_offset, host_ptr, CACHE_BLOCK_SIZE);
       
-      uint64_t phys_addr = xrtBuffer.address();
+
 
 
       xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, CACHE_BLOCK_SIZE, bo_offset);
