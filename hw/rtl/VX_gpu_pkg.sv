@@ -532,7 +532,9 @@ package VX_gpu_pkg;
 
 `ifdef EXT_TCU_ENABLE
     typedef struct packed {
-        logic [(INST_ARGS_BITS-16)-1:0] __padding;
+        logic [(INST_ARGS_BITS-16-16)-1:0] __padding;
+        logic [7:0] scale_b;
+        logic [7:0] scale_a;
         logic [3:0] fmt_d;
         logic [3:0] fmt_s;
         logic [3:0] step_n;
