@@ -1,4 +1,1 @@
-set_param project.enableReportConfiguration 0
-load_feature core
-current_fileset
-xsim {tb_snapshot} -autoloadwcfg
+xsim {tb_snapshot} -autoloadwcfg -tclbatch {xsim_run.tcl}

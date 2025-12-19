@@ -25,7 +25,7 @@ SRCS += $(RTL_DIR)/libs/VX_shift_register.sv
 SRCS += $(RTL_DIR)/libs/VX_dp_ram.sv
 SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_pkg.sv
 SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_top.sv
-SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_core.sv
+
 SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_scale.sv
 SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_fedp_scaled.sv
 SRCS += $(SIM_DIR)/tb_ag_tcu.sv

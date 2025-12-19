@@ -45,15 +45,12 @@ module VX_ag_tcu_top import VX_gpu_pkg::*, VX_ag_tcu_pkg::*; #(
 
     wire [7:0] scale_a = execute_data.op_args.tcu.scale_a;
     wire [7:0] scale_b = execute_data.op_args.tcu.scale_b;
-    wire [8:0] scale_combined;
+    
+    // Inline scale addition (formerly VX_ag_tcu_scale.sv)
+    wire [8:0] scale_combined = scale_a + scale_b;
 
-    VX_ag_tcu_scale ag_tcu_scale (
-        .scale_a        (scale_a),
-        .scale_b        (scale_b),
-        .scale_combined (scale_combined)
-    );
-
-    VX_ag_tcu_core #(
+    // Instantiate Scale Unit (formerly VX_ag_tcu_core)
+    VX_ag_tcu_scale #(
         .INSTANCE_ID (INSTANCE_ID)
     ) ag_tcu_unit (
         `SCOPE_IO_BIND (0)
