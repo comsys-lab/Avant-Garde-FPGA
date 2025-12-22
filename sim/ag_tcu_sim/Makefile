@@ -23,6 +23,8 @@ SRCS += $(RTL_DIR)/libs/VX_pipe_register.sv
 SRCS += $(RTL_DIR)/libs/VX_pending_size.sv
 SRCS += $(RTL_DIR)/libs/VX_shift_register.sv
 SRCS += $(RTL_DIR)/libs/VX_dp_ram.sv
+SRCS += $(RTL_DIR)/libs/VX_stream_buffer.sv
+SRCS += $(RTL_DIR)/libs/VX_skid_buffer.sv
 SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_pkg.sv
 SRCS += $(RTL_DIR)/ag-tcu/VX_ag_tcu_top.sv
 

@@ -43,8 +43,25 @@ module VX_ag_tcu_top import VX_gpu_pkg::*, VX_ag_tcu_pkg::*; #(
     assign execute_if.data = execute_data;
     assign execute_ready = execute_if.ready;
 
-    wire [7:0] scale_a = execute_data.op_args.tcu.scale_a;
-    wire [7:0] scale_b = execute_data.op_args.tcu.scale_b;
+    VX_execute_if #(
+        .data_t (ag_tcu_exe_t)
+    ) execute_if_buf();
+
+    VX_skid_buffer #(
+        .DATAW ($bits(ag_tcu_exe_t))
+    ) skid_buffer (
+        .clk       (clk),
+        .reset     (reset),
+        .valid_in  (execute_if.valid),
+        .ready_in  (execute_if.ready),
+        .data_in   (execute_if.data),
+        .valid_out (execute_if_buf.valid),
+        .ready_out (execute_if_buf.ready),
+        .data_out  (execute_if_buf.data)
+    );
+
+    wire [7:0] scale_a = execute_if_buf.data.op_args.tcu.scale_a;
+    wire [7:0] scale_b = execute_if_buf.data.op_args.tcu.scale_b;
     
     // Inline scale addition (formerly VX_ag_tcu_scale.sv)
     wire [8:0] scale_combined = scale_a + scale_b;
@@ -57,7 +74,7 @@ module VX_ag_tcu_top import VX_gpu_pkg::*, VX_ag_tcu_pkg::*; #(
         .clk            (clk),
         .reset          (reset),
         .scale_combined (scale_combined),
-        .execute_if     (execute_if),
+        .execute_if     (execute_if_buf), // Connect buffered interface
         .result_if      (result_if)
     );
 

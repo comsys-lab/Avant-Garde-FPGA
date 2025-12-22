@@ -21,14 +21,12 @@ package VX_ag_tcu_pkg;
     import VX_gpu_pkg::*;
 
     // Set configuration parameters
-    localparam AG_TCU_NT = `NUM_THREADS;
-    localparam AG_TCU_NR = 8;
+    localparam AG_TCU_NT = 8; // Decoupled from NUM_THREADS (4) to support 8-lane TCU
+    localparam AG_TCU_NR = 16;
     localparam AG_TCU_DP = 0;
 
     // Supported data types
-    localparam AG_TCU_FP32_ID = 0;
-    localparam AG_TCU_FP16_ID = 1;
-    localparam AG_TCU_BF16_ID = 2;
+
     localparam AG_TCU_I32_ID  = 8;
     localparam AG_TCU_I8_ID   = 9;
     localparam AG_TCU_U8_ID   = 10;
@@ -84,9 +82,7 @@ package VX_ag_tcu_pkg;
 `ifdef SIMULATION
     task trace_fmt(input int level, input [3:0] fmt);
         case (fmt)
-            AG_TCU_FP32_ID: `TRACE(level, ("fp32"))
-            AG_TCU_FP16_ID: `TRACE(level, ("fp16"))
-            AG_TCU_BF16_ID: `TRACE(level, ("bf16"))
+
             AG_TCU_I32_ID:  `TRACE(level, ("i32"))
             AG_TCU_I8_ID:   `TRACE(level, ("i8"))
             AG_TCU_U8_ID:   `TRACE(level, ("u8"))

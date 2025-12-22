@@ -396,7 +396,7 @@
 `endif
 
 // Number of TCU units
-`define NUM_TCU_LANES   `NUM_THREADS
+`define NUM_TCU_LANES   8
 `ifndef NUM_TCU_BLOCKS
 `define NUM_TCU_BLOCKS  `ISSUE_WIDTH
 `endif
