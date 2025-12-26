@@ -18,6 +18,8 @@
 
 `IGNORE_UNUSED_BEGIN
 
+`timescale 1ns / 1ps
+
 package VX_gpu_pkg;
 
 	localparam NC_BITS = `CLOG2(`NUM_CORES);

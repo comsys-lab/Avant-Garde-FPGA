@@ -37,6 +37,14 @@ DEFINES += -d EXT_TCU_ENABLE
 DEFINES += -d DBG_TRACE_AG_TCU
 DEFINES += -d VIVADO
 
+# OT Sources
+OT_RTL_DIR = ../../operand_transformer/rtl
+OT_SRCS += $(OT_RTL_DIR)/operand_tf_pkg.sv
+OT_SRCS += $(OT_RTL_DIR)/simple_multiplier.sv
+OT_SRCS += $(OT_RTL_DIR)/operand_tf_lane.sv
+OT_SRCS += $(OT_RTL_DIR)/operand_transformer_ctrl.sv
+OT_SRCS += $(OT_RTL_DIR)/operand_transformer_top.sv
+
 # Simulation target
 all: run
 
@@ -47,8 +55,19 @@ compile:
 	xvlog --sv $(DEFINES) $(INCLUDES) $(SRCS)
 	xelab -debug typical -top tb_ag_tcu -snapshot tb_snapshot
 
+# Integrated Test Target
+integrated: compile_integrated
+	xsim tb_integration_snapshot -tclbatch xsim_run.tcl
+
+compile_integrated:
+	xvlog --sv $(DEFINES) $(INCLUDES) $(SRCS) $(OT_SRCS) $(SIM_DIR)/tb_ot_tcu_integration.sv
+	xelab -debug typical -top tb_ot_tcu_integration -snapshot tb_integration_snapshot
+
 gui: compile
 	xsim tb_snapshot -gui
+
+gui_integrated: compile_integrated
+	xsim tb_integration_snapshot -gui
 
 clean:
 	rm -rf .Xil xsim.dir *.log *.pb *.jou *.wdb
