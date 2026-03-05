@@ -35,9 +35,7 @@ module VX_fetch import VX_gpu_pkg::*; #(
     reg [31:0] pc;
 
     always @(posedge clk) begin
-        if (fetch_if.valid && fetch_if.ready) begin
-             $display("%t: IFETCH: core%0d: PC=%h, instr=%h", $time, CORE_ID, fetch_if.data.PC, fetch_if.data.instr);
-        end
+        // IFETCH hardware specific assertions or logging could go here
     end
 
 

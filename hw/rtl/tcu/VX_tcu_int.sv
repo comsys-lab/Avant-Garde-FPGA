@@ -11,6 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// VX_tcu_int — Phase 7: pure FEDP compute unit.
+//
+// Phase 7 changes:
+//   - VX_tcu_operand_transformer removed (moved to VX_tcu_unit, upstream of this module)
+//   - exp_total read directly from execute_if.data.op_args.tcu.exp_total
+//   - is_nop / ldscale_hazard removed (handled by OT)
+//   - execute_if.ready simplified: ~mdata_queue_full && fedp_enable
+//   - Feedback ports added (ot_fedp_enable, ot_result_fire, ot_result_wid)
+//     for VX_tcu_operand_transformer wmma_inflight tracking
+//
+// PIPE_LATENCY (internal, for mdata_queue depth):
+//   FEDP_LATENCY(4) + mdata(1) = 5 (unchanged from Phase 6).
+//   Total pipeline including OT = 6 (tracked in VX_tcu_unit).
+
 `include "VX_define.vh"
 
 module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
@@ -21,11 +35,20 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input wire          clk,
     input wire          reset,
 
-    // Inputs
+    // Inputs (from VX_tcu_operand_transformer when EXT_AG_TCU_ENABLE)
     VX_execute_if.slave execute_if,
 
     // Outputs
-    VX_result_if.master result_if
+    VX_result_if.master result_if,
+
+    // Feedback to VX_tcu_operand_transformer (EXT_AG_TCU_ENABLE only)
+    // These are always driven (tied to 0 in non-AG build) so VX_tcu_unit
+    // can connect them unconditionally inside the ifdef block.
+`ifdef EXT_AG_TCU_ENABLE
+    output wire                    ot_fedp_enable,
+    output wire                    ot_result_fire,
+    output wire [NW_WIDTH-1:0]     ot_result_wid
+`endif
 );
     `UNUSED_SPARAM (INSTANCE_ID);
 
@@ -34,7 +57,7 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam ADD_LATENCY  = 1;
     localparam ACC_LATENCY  = $clog2(TCU_TC_K) * ADD_LATENCY + ADD_LATENCY;
     localparam FEDP_LATENCY = MUL_LATENCY + ACC_LATENCY;
-    localparam PIPE_LATENCY = FEDP_LATENCY + 1;
+    localparam PIPE_LATENCY = FEDP_LATENCY + 1;         // Internal: 5 cycles
     localparam MDATA_QUEUE_DEPTH = 1 << $clog2(PIPE_LATENCY);
 
     localparam LG_A_BS = $clog2(TCU_A_BLOCK_SIZE);
@@ -47,8 +70,6 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [3:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [3:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
 
-    `UNUSED_VAR ({step_m, step_n, fmt_s, fmt_d});
-
     wire [MDATA_WIDTH-1:0] mdata_queue_din, mdata_queue_dout;
     wire mdata_queue_full;
 
@@ -60,10 +81,13 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     };
 
     wire execute_fire = execute_if.valid && execute_if.ready;
-    wire result_fire = result_if.valid && result_if.ready;
+    wire result_fire  = result_if.valid  && result_if.ready;
     wire fedp_enable, fedp_done;
 
-    // FEDP delay handling
+    // Phase 7: no ldscale_hazard here (OT handles it upstream)
+    assign execute_if.ready = ~mdata_queue_full && fedp_enable;
+
+    // FEDP delay pipe
     reg [PIPE_LATENCY-1:0] fedp_delay_pipe;
     always @(posedge clk) begin
         if (reset) begin
@@ -79,9 +103,18 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
     assign fedp_done = fedp_delay_pipe[0];
 
-    assign result_if.valid  = fedp_done;
-    assign fedp_enable      = ~result_if.valid || result_if.ready;
-    assign execute_if.ready = ~mdata_queue_full && fedp_enable;
+    assign result_if.valid = fedp_done;
+    assign fedp_enable     = ~result_if.valid || result_if.ready;
+
+    // Feedback to OT (Phase 7)
+`ifdef EXT_AG_TCU_ENABLE
+    wire [NW_WIDTH-1:0] result_wid_w =
+        mdata_queue_dout[NW_WIDTH + PC_BITS + NUM_REGS_BITS - 1 : PC_BITS + NUM_REGS_BITS];
+
+    assign ot_fedp_enable = fedp_enable;
+    assign ot_result_fire = result_fire;
+    assign ot_result_wid  = result_wid_w;
+`endif
 
     VX_fifo_queue #(
         .DATAW (MDATA_WIDTH),
@@ -117,6 +150,39 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             wire [TCU_TC_K-1:0][`XLEN-1:0] a_row_r, b_col_r;
             wire [`XLEN-1:0] c_val_r;
 
+`ifdef EXT_AG_TCU_ENABLE
+            // Phase 7: exp_total read directly from execute_if.data.op_args.tcu.exp_total
+            // (set by VX_tcu_operand_transformer upstream).
+            // Operands already zero-gated by OT for LDSCALE/LDTILE — no is_nop_xf needed.
+            wire signed [TCU_EXP_TOTAL-1:0] exp_total_r;
+
+            `BUFFER_EX (
+                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r,    exp_total_r},
+                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0], execute_if.data.op_args.tcu.exp_total},
+                fedp_enable,
+                0, // resetw
+                1  // depth
+            );
+
+            VX_tcu_fedp_int_scaled #(
+                .LATENCY   (FEDP_LATENCY),
+                .N         (TCU_TC_K),
+                .EXP_TOTAL (TCU_EXP_TOTAL)
+            ) fedp (
+                .clk       (clk),
+                .reset     (reset),
+                .enable    (fedp_enable),
+                .fmt_s     (fmt_s_r),
+                .fmt_d     (fmt_d_r),
+                .exp_total (exp_total_r),
+                .a_row     (a_row_r),
+                .b_col     (b_col_r),
+                .c_val     (c_val_r),
+                .d_val     (d_val[i][j])
+            );
+`else
+            `UNUSED_VAR ({step_m, step_n, fmt_s, fmt_d});
+
             `BUFFER_EX (
                 {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r},
                 {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0]},
@@ -139,6 +205,7 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 .c_val (c_val_r),
                 .d_val (d_val[i][j])
             );
+`endif
 
         `ifdef DBG_TRACE_TCU
             always @(posedge clk) begin
@@ -156,6 +223,12 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif // DBG_TRACE_TCU
         end
     end
+
+`ifdef EXT_AG_TCU_ENABLE
+    // In AG build, step_m/step_n/fmt_s/fmt_d are used above; no UNUSED_VAR needed
+`else
+    // Non-AG build: these are used in the else branch above
+`endif
 
     assign result_if.data.wb  = 1;
     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};

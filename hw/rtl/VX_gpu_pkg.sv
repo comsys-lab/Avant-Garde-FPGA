@@ -531,8 +531,31 @@ package VX_gpu_pkg;
     `PACKAGE_ASSERT($bits(wctl_args_t) == INST_ARGS_BITS)
 
 `ifdef EXT_TCU_ENABLE
+`ifdef EXT_AG_TCU_ENABLE
+    // AG-TCU: WMMA vs scale-load vs tile-load operation selector (2-bit)
+    // tcu_op=00 → WMMA; tcu_op=01 → LDSCALE; tcu_op=10 → LDTILE
+    typedef enum logic [1:0] {
+        TCU_OP_WMMA    = 2'b00,
+        TCU_OP_LDSCALE = 2'b01,
+        TCU_OP_LDTILE  = 2'b10
+    } tcu_op_e;
+`endif
+
     typedef struct packed {
+    `ifdef EXT_AG_TCU_ENABLE
+        // AG-TCU: Avant-Garde flatten architecture.
+        // Scale context written by LDSCALE; tile data loaded via FLW (HW-transparent).
+        // tcu_op (2-bit) selects WMMA / LDSCALE / LDTILE.
+        // tile_type (2-bit): 0=TILE_A, 1=TILE_B, 2=TILE_C.
+        // exp_total (10-bit signed): OT pipeline output, [-254, +256].
+        //   Set by VX_tcu_operand_xformer (Phase 7). TCU_EXP_TOTAL=10 (VX_tcu_pkg).
+        logic [(INST_ARGS_BITS-30)-1:0]  __padding;
+        logic signed [9:0]               exp_total;  // E8M0: scale_a + scale_b - 254
+        tcu_op_e                         tcu_op;     // 2'b00=WMMA, 2'b01=LDSCALE, 2'b10=LDTILE
+        logic [1:0]                      tile_type;  // TILE_A=0, TILE_B=1, TILE_C=2
+    `else
         logic [(INST_ARGS_BITS-16)-1:0] __padding;
+    `endif
         logic [3:0] fmt_d;
         logic [3:0] fmt_s;
         logic [3:0] step_n;
