@@ -401,6 +401,15 @@
 `define NUM_TCU_BLOCKS  `ISSUE_WIDTH
 `endif
 
+// AG-TCU: Avant-Garde Scaled Numeric Format extension
+// Requires EXT_TCU_ENABLE. Adds tile-level shared exponent (exp_a, exp_b)
+// and partial-sum alignment stage to the integer TCU datapath.
+`ifdef EXT_AG_TCU_ENABLE
+    `ifndef EXT_TCU_ENABLE
+        `define EXT_TCU_ENABLE
+    `endif
+`endif
+
 // Size of Instruction Buffer
 `ifndef IBUF_SIZE
 `define IBUF_SIZE   4
@@ -900,6 +909,12 @@
     `define EXT_TCU_ENABLED 1
 `else
     `define EXT_TCU_ENABLED 0
+`endif
+
+`ifdef EXT_AG_TCU_ENABLE
+    `define EXT_AG_TCU_ENABLED 1
+`else
+    `define EXT_AG_TCU_ENABLED 0
 `endif
 
 `define ISA_STD_A           0

@@ -31,14 +31,31 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam NUM_LANES  = `NUM_TCU_LANES;
     localparam PE_COUNT   = 2;
 
-    // PIPE_LATENCY for scoreboard: Phase 7 adds 1-cycle OT stage before VX_tcu_int
-    // VX_tcu_int internal PIPE_LATENCY = FEDP_LATENCY + 1 = 5
-    // Total = OT(1) + FEDP(4) + mdata(1) = 6 cycles
+    // PIPE_LATENCY for scoreboard.
+    // Phase 9: OT(1cy) is before pe_switch (handles both INT and FP paths).
+    //   INT path: OT(1) + VX_tcu_int(5) = 6cy
+    //   FP  path: OT(1) + VX_tcu_fp(FEDP_LATENCY_FP+1)  [backend-dependent]
+/* verilator lint_off UNUSEDPARAM */
 `ifdef EXT_AG_TCU_ENABLE
-    localparam TCU_UNIT_PIPE_LATENCY = 6;  // With OT stage
+    localparam TCU_UNIT_PIPE_LATENCY = 6;  // Scoreboard uses INT path latency (conservative)
 `else
     localparam TCU_UNIT_PIPE_LATENCY = 5;  // Without OT stage
 `endif
+
+`ifdef EXT_AG_TCU_ENABLE
+    // PIPE_LATENCY_FP: VX_tcu_fp internal FEDP_LATENCY + 1 (mdata/result)
+    // Mirrors the localparam computation in VX_tcu_fp.sv.
+`ifdef TCU_DSP
+    localparam PIPE_LATENCY_FP = 1 + 8 + $clog2(2*TCU_TC_K+1)*11 + 11 + 1;
+`elsif TCU_DPI
+    localparam PIPE_LATENCY_FP = 2 + 2 + 1;  // FMUL(2)+FACC(2)+mdata(1)
+`elsif TCU_BHF
+    localparam PIPE_LATENCY_FP = (2+1) + 1 + $clog2(2*TCU_TC_K+1)*(2+1) + (2+1) + 1;
+`else
+    localparam PIPE_LATENCY_FP = 5;  // fallback
+`endif
+`endif
+/* verilator lint_on UNUSEDPARAM */
 
     `STATIC_ASSERT (BLOCK_SIZE == `ISSUE_WIDTH, ("must be full issue execution"));
     `STATIC_ASSERT (NUM_LANES == `NUM_THREADS, ("must be full warp execution"));
@@ -73,15 +90,79 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .data_t (tcu_res_t)
         ) pe_result_if[PE_COUNT]();
 
-        // LDSCALE / LDTILE must always route to the INT path (pe_sel=1) regardless
-        // of fmt_s[3], because the NOP handling is inside VX_tcu_operand_transformer.
 `ifdef EXT_AG_TCU_ENABLE
-        wire pe_sel_w = per_block_execute_if[block_idx].data.op_args.tcu.fmt_s[3]
-                      | (per_block_execute_if[block_idx].data.op_args.tcu.tcu_op == TCU_OP_LDSCALE)
-                      | (per_block_execute_if[block_idx].data.op_args.tcu.tcu_op == TCU_OP_LDTILE);
+        // Phase 9: OT before pe_switch — handles both INT and FP paths.
+        // per_block_execute_if → OT(1cy) → ot_execute_if → pe_switch → {tcu_fp, tcu_int}
+
+        VX_execute_if #(
+            .data_t (tcu_exe_t)
+        ) ot_execute_if();
+
+        // Feedback wires from VX_tcu_int (INT path)
+        wire        ot_fedp_enable;
+        wire        ot_result_fire;
+        wire [NW_WIDTH-1:0] ot_result_wid;
+
+        VX_tcu_operand_transformer #(
+            .PIPE_LATENCY_INT (5)  // VX_tcu_int internal: FEDP(4)+mdata(1)
+        ) operand_xformer (
+            .clk            (clk),
+            .reset          (reset),
+            .execute_if_in  (per_block_execute_if[block_idx]),
+            .execute_if_out (ot_execute_if),
+            .fedp_enable    (ot_fedp_enable),
+            .result_fire    (ot_result_fire),
+            .result_wid     (ot_result_wid)
+        );
+
+        // LDSCALE/LDTILE always → INT path (pe_sel=1); evaluated on OT output.
+        wire pe_sel_w = ot_execute_if.data.op_args.tcu.fmt_s[3]
+                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDSCALE)
+                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDTILE);
+
+        VX_pe_switch #(
+            .PE_COUNT    (PE_COUNT),
+            .NUM_LANES   (NUM_LANES),
+            .ARBITER     ("R"),
+            .REQ_OUT_BUF (0),
+            .RSP_OUT_BUF (3)
+        ) pe_switch (
+            .clk            (clk),
+            .reset          (reset),
+            .pe_sel         (pe_sel_w),
+            .execute_in_if  (ot_execute_if),
+            .result_out_if  (per_block_result_if[block_idx]),
+            .execute_out_if (pe_execute_if),
+            .result_in_if   (pe_result_if)
+        );
+
+        VX_tcu_fp #(
+            .INSTANCE_ID (`SFORMATF(("%s-fp%0d", INSTANCE_ID, block_idx)))
+        ) tcu_fp (
+            `SCOPE_IO_BIND (block_idx)
+            .clk            (clk),
+            .reset          (reset),
+            .execute_if     (pe_execute_if[0]),
+            .result_if      (pe_result_if[0])
+        );
+
+        VX_tcu_int #(
+            .INSTANCE_ID (`SFORMATF(("%s-int%0d", INSTANCE_ID, block_idx)))
+        ) tcu_int (
+            `SCOPE_IO_BIND (block_idx)
+            .clk            (clk),
+            .reset          (reset),
+            .execute_if     (pe_execute_if[1]),
+            .result_if      (pe_result_if[1]),
+            // Feedback to OT
+            .ot_fedp_enable (ot_fedp_enable),
+            .ot_result_fire (ot_result_fire),
+            .ot_result_wid  (ot_result_wid)
+        );
+
 `else
+        // Non-AG: no OT; pe_sel direct from dispatch.
         wire pe_sel_w = per_block_execute_if[block_idx].data.op_args.tcu.fmt_s[3];
-`endif
 
         VX_pe_switch #(
             .PE_COUNT    (PE_COUNT),
@@ -109,46 +190,6 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .result_if  (pe_result_if[0])
         );
 
-`ifdef EXT_AG_TCU_ENABLE
-        // Phase 7: OT stage between pe_switch and VX_tcu_int (INT path only)
-        // pe_execute_if[1] (from pe_switch) → OT → ot_execute_if → VX_tcu_int
-
-        // OT execute interface (output side of OT, input to VX_tcu_int)
-        VX_execute_if #(
-            .data_t (tcu_exe_t)
-        ) ot_execute_if();
-
-        // Feedback wires from VX_tcu_int back to OT
-        wire        ot_result_fire;
-        wire [NW_WIDTH-1:0] ot_result_wid;
-        wire        ot_fedp_enable;
-
-        VX_tcu_operand_transformer #(
-            .PIPE_LATENCY (5)  // VX_tcu_int internal latency: FEDP(4)+mdata(1)
-        ) operand_xformer (
-            .clk            (clk),
-            .reset          (reset),
-            .execute_if_in  (pe_execute_if[1]),
-            .execute_if_out (ot_execute_if),
-            .fedp_enable    (ot_fedp_enable),
-            .result_fire    (ot_result_fire),
-            .result_wid     (ot_result_wid)
-        );
-
-        VX_tcu_int #(
-            .INSTANCE_ID (`SFORMATF(("%s-int%0d", INSTANCE_ID, block_idx)))
-        ) tcu_int (
-            `SCOPE_IO_BIND (block_idx)
-            .clk         (clk),
-            .reset       (reset),
-            .execute_if  (ot_execute_if),
-            .result_if   (pe_result_if[1]),
-            // Feedback to OT
-            .ot_fedp_enable (ot_fedp_enable),
-            .ot_result_fire (ot_result_fire),
-            .ot_result_wid  (ot_result_wid)
-        );
-`else
         VX_tcu_int #(
             .INSTANCE_ID (`SFORMATF(("%s-int%0d", INSTANCE_ID, block_idx)))
         ) tcu_int (

@@ -84,10 +84,15 @@ module VX_tcu_uops import
     assign ibuf_out.PC        = ibuf_in.PC;
     assign ibuf_out.ex_type   = ibuf_in.ex_type;
     assign ibuf_out.op_type   = ibuf_in.op_type;
-    assign ibuf_out.op_args.tcu.fmt_s = ibuf_in.op_args.tcu.fmt_s;
-    assign ibuf_out.op_args.tcu.fmt_d = ibuf_in.op_args.tcu.fmt_d;
+    assign ibuf_out.op_args.tcu.fmt_s  = ibuf_in.op_args.tcu.fmt_s;
+    assign ibuf_out.op_args.tcu.fmt_d  = ibuf_in.op_args.tcu.fmt_d;
     assign ibuf_out.op_args.tcu.step_m = 4'(m_index);
     assign ibuf_out.op_args.tcu.step_n = 4'(n_index);
+`ifdef EXT_AG_TCU_ENABLE
+    // AG-TCU: all microops from uop_sequencer are WMMA type
+    // (LDSCALE is excluded from uop expansion by VX_uop_sequencer).
+    assign ibuf_out.op_args.tcu.tcu_op = TCU_OP_WMMA;
+`endif
     assign ibuf_out.wb        = 1;
     assign ibuf_out.used_rs   = ibuf_in.used_rs;
     assign ibuf_out.rs1       = make_reg_num(REG_TYPE_F, rs1);

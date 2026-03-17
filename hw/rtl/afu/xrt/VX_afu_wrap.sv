@@ -298,7 +298,8 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     `ifdef SIMULATION
     localparam [C_M_AXI_MEM_ADDR_WIDTH-1:0] AXI_MEM_OFFSET = 64'h0;
     `else
-    localparam [C_M_AXI_MEM_ADDR_WIDTH-1:0] AXI_MEM_OFFSET = 64'h5000000000;
+    // DDR bank0 base address = 0x4000000000 (matches connectivity.cfg DDR[0])
+    localparam [C_M_AXI_MEM_ADDR_WIDTH-1:0] AXI_MEM_OFFSET = 64'h4000000000;
     `endif
 		assign m_axi_mem_awaddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_awaddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(0) + AXI_MEM_OFFSET;
 		assign m_axi_mem_araddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_araddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(0) + AXI_MEM_OFFSET;

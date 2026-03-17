@@ -25,6 +25,16 @@ package VX_tcu_pkg;
     localparam TCU_NR = 8;
     localparam TCU_DP = 0;
 
+`ifdef EXT_AG_TCU_ENABLE
+    // Avant-Garde flatten: scale factor bits per operand side (A or B).
+    // Phase 5: E8M0 format — 8-bit unsigned, bias=127 (value = 2^(exp-127)).
+    // exp_total = scale_a + scale_b - 2*bias; range [-254, +256], clamped to [-31, +30].
+    // Stored in VX_tcu_scale_ctx per warp (LDSCALE writes, WMMA reads combinationally).
+    localparam TCU_EXP_BITS  = 8;   // bits per side (unsigned: 0..255)
+    localparam TCU_EXP_BIAS  = 127; // E8M0 bias (neutral: scale=127 → exp_total=0)
+    localparam TCU_EXP_TOTAL = 10;  // signed sum width (covers [-254, +256])
+`endif
+
     // Supported data types
     localparam TCU_FP32_ID = 0;
     localparam TCU_FP16_ID = 1;

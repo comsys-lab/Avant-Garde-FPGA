@@ -26,6 +26,7 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // Outputs
     VX_result_if.master result_if
+
 );
     `UNUSED_SPARAM (INSTANCE_ID);
 

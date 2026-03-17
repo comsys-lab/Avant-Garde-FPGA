@@ -126,6 +126,31 @@ module tb_tcu_wmma;
         return sat + $signed(rs3[i * TCU_TC_N + j]);
     endfunction
 
+`ifdef EXT_AG_TCU_ENABLE
+    // =========================================================================
+    // OT redesign: MX9 flatten reference model
+    //   byte_in = {micro_exp[1b], INT7_mantissa[7b]}
+    //   element_value = m7 × 2^mexp → flat = mexp ? m8<<1 : m8
+    //   OT always applies this for INT WMMA — no mode flag needed.
+    // =========================================================================
+    function automatic logic [7:0] ref_flatten_mx9_byte(input logic [7:0] byte_in);
+        logic              mexp;
+        logic signed [7:0] m8;
+        mexp = byte_in[7];
+        m8   = $signed({byte_in[6], byte_in[6:0]});  // sign_ext7 → INT8
+        return mexp ? m8 <<< 1 : m8;
+    endfunction
+
+    function automatic logic [31:0] ref_flatten_mx9_word(input logic [31:0] w);
+        logic [31:0] res;
+        res[ 7: 0] = ref_flatten_mx9_byte(w[ 7: 0]);
+        res[15: 8] = ref_flatten_mx9_byte(w[15: 8]);
+        res[23:16] = ref_flatten_mx9_byte(w[23:16]);
+        res[31:24] = ref_flatten_mx9_byte(w[31:24]);
+        return res;
+    endfunction
+`endif
+
     // =========================================================================
     // fire_dispatch: drive one dispatch handshake
     // =========================================================================
@@ -336,19 +361,32 @@ module tb_tcu_wmma;
             wait_commit(res);
 
             // --- Per-element verify & D_mat update ----------------------------
-            for (int ii = 0; ii < TCU_TC_M; ii++) begin
-                for (int jj = 0; jj < TCU_TC_N; jj++) begin
-                    logic signed [31:0] got, exp_val;
-                    got     = $signed(res.data[ii * TCU_TC_N + jj]);
-                    exp_val = ref_d(rs1_in, rs2_in, rs3_in, exp_total, ii, jj, b_off);
+            begin
+                logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_ref, rs2_ref;
+`ifdef EXT_AG_TCU_ENABLE
+                // OT always flattens INT WMMA: apply same flatten to reference
+                for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                    rs1_ref[t] = ref_flatten_mx9_word(rs1_in[t]);
+                    rs2_ref[t] = ref_flatten_mx9_word(rs2_in[t]);
+                end
+`else
+                rs1_ref = rs1_in;
+                rs2_ref = rs2_in;
+`endif
+                for (int ii = 0; ii < TCU_TC_M; ii++) begin
+                    for (int jj = 0; jj < TCU_TC_N; jj++) begin
+                        logic signed [31:0] got, exp_val;
+                        got     = $signed(res.data[ii * TCU_TC_N + jj]);
+                        exp_val = ref_d(rs1_ref, rs2_ref, rs3_in, exp_total, ii, jj, b_off);
 
-                    // Write DUT output back to D_mat (register-file feedback)
-                    D_mat[sm][sn][ii][jj] = res.data[ii * TCU_TC_N + jj];
+                        // Write DUT output back to D_mat (register-file feedback)
+                        D_mat[sm][sn][ii][jj] = res.data[ii * TCU_TC_N + jj];
 
-                    if (got !== exp_val) begin
-                        $display("[FAIL] %-28s ctr=%2d (m=%0d,n=%0d,k=%0d) [%0d][%0d] got=%0d exp=%0d",
-                                 name, ctr, sm, sn, sk, ii, jj, got, exp_val);
-                        test_pass = 0;
+                        if (got !== exp_val) begin
+                            $display("[FAIL] %-28s ctr=%2d (m=%0d,n=%0d,k=%0d) [%0d][%0d] got=%0d exp=%0d",
+                                     name, ctr, sm, sn, sk, ii, jj, got, exp_val);
+                            test_pass = 0;
+                        end
                     end
                 end
             end
@@ -482,17 +520,29 @@ module tb_tcu_wmma;
                         for (int jj = 0; jj < TCU_TC_N; jj++)
                             rs3_t[ii * TCU_TC_N + jj] = D_mat[sm][sn][ii][jj];
 
-                    for (int ii = 0; ii < TCU_TC_M; ii++) begin
-                        for (int jj = 0; jj < TCU_TC_N; jj++) begin
-                            logic signed [31:0] got_s, exp_s;
-                            got_s = $signed(grp_res[kgi].data[ii * TCU_TC_N + jj]);
-                            exp_s = ref_d(rs1_t, rs2_t, rs3_t, exp_total, ii, jj, b_off);
-                            // Update D_mat AFTER computing expected (for next k-group)
-                            D_mat[sm][sn][ii][jj] = grp_res[kgi].data[ii * TCU_TC_N + jj];
-                            if (got_s !== exp_s) begin
-                                $display("[FAIL] %-28s k=%0d kgi=%0d [%0d][%0d] got=%0d exp=%0d",
-                                         name, kg, kgi, ii, jj, got_s, exp_s);
-                                test_pass = 0;
+                    begin
+                        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_ref2, rs2_ref2;
+`ifdef EXT_AG_TCU_ENABLE
+                        for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                            rs1_ref2[t] = ref_flatten_mx9_word(rs1_t[t]);
+                            rs2_ref2[t] = ref_flatten_mx9_word(rs2_t[t]);
+                        end
+`else
+                        rs1_ref2 = rs1_t;
+                        rs2_ref2 = rs2_t;
+`endif
+                        for (int ii = 0; ii < TCU_TC_M; ii++) begin
+                            for (int jj = 0; jj < TCU_TC_N; jj++) begin
+                                logic signed [31:0] got_s, exp_s;
+                                got_s = $signed(grp_res[kgi].data[ii * TCU_TC_N + jj]);
+                                exp_s = ref_d(rs1_ref2, rs2_ref2, rs3_t, exp_total, ii, jj, b_off);
+                                // Update D_mat AFTER computing expected (for next k-group)
+                                D_mat[sm][sn][ii][jj] = grp_res[kgi].data[ii * TCU_TC_N + jj];
+                                if (got_s !== exp_s) begin
+                                    $display("[FAIL] %-28s k=%0d kgi=%0d [%0d][%0d] got=%0d exp=%0d",
+                                             name, kg, kgi, ii, jj, got_s, exp_s);
+                                    test_pass = 0;
+                                end
                             end
                         end
                     end
@@ -581,31 +631,35 @@ module tb_tcu_wmma;
         end
 
         // ====================================================================
-        // TC5: Negative × Positive (all-0xFF A vs all-0x01 B), exp=0
+        // TC5: Negative × Positive, exp=0
+        //   MX9: A byte=0x7F={mexp=0, m7=7'b1111111=-1} → flat=-1
+        //        B byte=0x01={mexp=0, m7=+1} → flat=+1
         //   dot per k-step = TC_K*4*(-1)*(+1) = -8
         //   After K_STEPS=2: d[i][j] = -16
         // ====================================================================
-        fill_A(32'hFFFFFFFF); fill_B(32'h01010101); fill_D(32'd0);
+        fill_A(32'h7F7F7F7F); fill_B(32'h01010101); fill_D(32'd0);
         run_wmma("TC5_neg_dot", 8'd127, 8'd127);
 
         // ====================================================================
-        // TC6: Positive saturation path — (-128)×(-128), exp_total=+14 (max)
+        // TC6: Positive saturation path — flat=-128, exp_total=+14 (max)
+        //   MX9: byte=0xC0={mexp=1, m7=-64} → flat=-64<<1=-128
         //   dot = TC_K*4*128^2 = 131072 per k
         //   131072 << 14 = 2147483648 > INT32_MAX → saturate to INT32_MAX
         //   After k=0: INT32_MAX + 0 = INT32_MAX
         //   After k=1: INT32_MAX + INT32_MAX = -2 (32-bit wrap, no final sat)
         // ====================================================================
-        fill_A(32'h80808080); fill_B(32'h80808080); fill_D(32'd0);
+        fill_A(32'hC0C0C0C0); fill_B(32'hC0C0C0C0); fill_D(32'd0);
         run_wmma("TC6_pos_saturation", 8'd134, 8'd134);
 
         // ====================================================================
         // TC7: Right-shift with negative dot — Phase 4② coverage
-        //   A=-128 (0x80), B=+127 (0x7F), exp_a=-2, exp_b=0 → exp_total=-2
-        //   dot = TC_K*4*(-128)*(+127) = -130048 per k
-        //   -130048 >>> 2 = -32512
-        //   After k=0: D=-32512  After k=1: D=-65024
+        //   MX9: A byte=0x7F={mexp=0,m7=-1}→flat=-1; B byte=0x01→flat=+1
+        //   exp_a=-2, exp_b=0 → exp_total=-2
+        //   dot = TC_K*4*(-1)*(+1) = -8 per k
+        //   -8 >>> 2 = -2 per k
+        //   After k=0: D=-2  After k=1: D=-4
         // ====================================================================
-        fill_A(32'h80808080); fill_B(32'h7F7F7F7F); fill_D(32'd0);
+        fill_A(32'h7F7F7F7F); fill_B(32'h01010101); fill_D(32'd0);
         run_wmma("TC7_rshift_neg_dot", 8'd125, 8'd127);
 
         // ====================================================================
@@ -726,18 +780,19 @@ module tb_tcu_wmma;
 `ifdef TESTS_SAT
         // ====================================================================
         // TC13: Max positive exponent (exp_total=+14)
-        //   A=B=-128 (0x80), dot = TC_K*4*128^2 = 131072 per k
+        //   MX9: byte=0xC0={mexp=1,m7=-64}→flat=-128
+        //   dot = TC_K*4*128^2 = 131072 per k
         //   131072 << 14 = 2147483648 > INT32_MAX → sat = INT32_MAX each k-step
         //   After k=0: INT32_MAX + 0 = INT32_MAX
         //   After k=1: INT32_MAX + INT32_MAX = -2 (wrapping 32-bit add)
         // ====================================================================
-        fill_A(32'h80808080); fill_B(32'h80808080); fill_D(32'd0);
+        fill_A(32'hC0C0C0C0); fill_B(32'hC0C0C0C0); fill_D(32'd0);
         run_wmma("TC13_exp14_sat", 8'd134, 8'd134);
 
         // ====================================================================
         // TC14: Asymmetric saturation — row 0 saturates, row 1 does not
         //   A_mat[*][*][0][*]=-128 (0x80), A_mat[*][*][1][*]=+1 (0x01)
-        //   B=-128 (0x80), exp_total=+14
+        //   MX9: 0xC0={mexp=1,m7=-64}→flat=-128; 0x01→flat=+1
         //   dot[0][j] = TC_K*4*(-128)*(-128) = 131072 → <<14 > INT32_MAX → +sat
         //   dot[1][j] = TC_K*4*(+1)*(-128) = -1024 → -1024<<14 = -16777216 (no sat)
         //   After k=0: D[0][j]=INT32_MAX,  D[1][j]=-16777216
@@ -749,20 +804,20 @@ module tb_tcu_wmma;
                     for (int ii = 0; ii < TCU_TC_M; ii++)
                         for (int kk = 0; kk < TCU_TC_K; kk++)
                             A_mat[sm_g][sk_g][ii][kk] =
-                                (ii == 0) ? 32'h80808080 : 32'h01010101;
-            fill_B(32'h80808080);
+                                (ii == 0) ? 32'hC0C0C0C0 : 32'h01010101;
+            fill_B(32'hC0C0C0C0);
             fill_D(32'd0);
             run_wmma("TC14_asymm_sat", 8'd134, 8'd134);
         end
 
         // ====================================================================
         // TC15: Non-zero C + saturation → wrapping in opposite direction
-        //   A=B=-128 (0x80), C=1, exp_total=+14
+        //   MX9: byte=0xC0={mexp=1,m7=-64}→flat=-128; A=B flat=-128, C=1
         //   sat = INT32_MAX each k-step (131072<<14 = INT32_MAX+1 → clamp)
         //   After k=0: INT32_MAX + 1 = INT32_MIN  (positive wraps to negative!)
         //   After k=1: INT32_MAX + INT32_MIN = -1
         // ====================================================================
-        fill_A(32'h80808080); fill_B(32'h80808080); fill_D(32'd1);
+        fill_A(32'hC0C0C0C0); fill_B(32'hC0C0C0C0); fill_D(32'd1);
         run_wmma("TC15_nonzero_C_sat", 8'd134, 8'd134);
 
         // ====================================================================
@@ -770,7 +825,7 @@ module tb_tcu_wmma;
         //   Safe mode as reference → D_mat_save → streaming → compare
         // ====================================================================
         begin
-            fill_A(32'h80808080); fill_B(32'h80808080); fill_D(32'd1);
+            fill_A(32'hC0C0C0C0); fill_B(32'hC0C0C0C0); fill_D(32'd1);
             run_wmma("TC16_safe_sat_ref", 8'd134, 8'd134);
             D_mat_save = D_mat;
 

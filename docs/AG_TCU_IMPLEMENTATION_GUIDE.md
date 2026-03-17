@@ -394,6 +394,23 @@ preload_gpr(SCALE_REG, 32'h7F81);  // exp_total=+2
 | tb_issue | 5/5 PASS |
 | tb_decode | 7/7 PASS |
 
+#### 검증 결과 (Phase 8A)
+| TB | 결과 |
+|----|------|
+| tb_int | 10/10 PASS |
+| tb_unit NT=4 | 20/20 PASS (12기존 + 6 mexp + 2 hazard) |
+| tb_unit NT=8 | 20/20 PASS |
+| tb_wmma test-safe NT=4 | 9/9 PASS |
+| tb_wmma test-safe NT=8 | 9/9 PASS |
+| tb_wmma test-mexp NT=4 | 6/6 PASS |
+| tb_wmma test-mexp NT=8 | 6/6 PASS |
+| tb_execute | 10/10 PASS |
+| tb_issue | 5/5 PASS |
+| tb_decode | 7/7 PASS |
+
+> **NT=8 Verilator 주의**: Phase 8A TCs는 `TESTS_MEXP` ifdef로 분리. `test-mexp-nt8` 타겟으로 실행.
+> Verilator 5.028 coroutine split bug → NT=8에서 단일 initial block에 TC 과다 포함 시 deadlock.
+
 #### Phase 7 OT 단계적 수행 (combinational 부분)
 ```
 scale_ctx.read(wid) → rd_scale_a, rd_scale_b
@@ -410,7 +427,7 @@ ot_exe_data.rs2_data  ← is_nop ? '0 : pe_rs2
 ← 이후 VX_tcu_int FEDP에서 직접 사용
 ```
 
-### Phase 8 — HW Flatten OT: micro-exp 원소별 flatten (논문 정석)
+### Phase 8A — HW Flatten OT: micro-exp 원소별 flatten (논문 정석) ✅ 완료
 
 #### 핵심 아키텍처 전환
 
@@ -422,8 +439,29 @@ FEDP: MAC → (dot << exp_total) → sat → acc   [post-MAC scaling]
 
 **Phase 8 목표 (논문 정석)**:
 ```
-OT: A_flat[i] = mantissa_A[i] << micro_exp_A[i]  [pre-MAC element-wise]
-FEDP: MAC → (dot << exp_total) → sat → acc       [block_exp 유지]
+OT: A_flat[i] = sign_ext7(mantissa[i]) << micro_exp[i]  [pre-MAC element-wise]
+FEDP: MAC → (dot << exp_total) → sat → acc              [block_exp 유지]
+```
+
+#### MX9 블록 구조 및 Vortex 파라미터 매핑
+
+**MX9 블록 정의**:
+```
+한 블록 = 16 elements:
+  ├── 1 × 8-bit E8M0 global_exp   (16개 원소 공유) → LDSCALE 1회
+  ├── 8 × 1-bit micro_exp          (2개 원소마다 1비트, pair shared)
+  └── 16 × 8-bit INT8 mantissa
+```
+
+**Vortex 파라미터와의 정합 (NT=4)**:
+```
+TILE_K = 4 words/thread × 4 INT8/word = 16 INT8 per thread (K-dim)
+                                         ↑ 정확히 MX9 블록 크기 ✓
+
+K_STEPS=2 × TC_K=2 × 4 bytes = 16 elements per warp-K = 1 global_exp ✓
+
+FEDP 1회 호출: TC_K=2 words × 4 = 8 elements = 4 pairs → 4 micro_exp bits
+32-bit word 1개: 4 elements = 2 pairs → 2 micro_exp bits
 ```
 
 #### block_exp가 post-MAC 적용되는 수학적 근거
@@ -442,36 +480,280 @@ dot = Σ (mantissa_A[i] × 2^sa) × (mantissa_B[i] × 2^sb)
 | **micro_exp** (1-bit, per 2 elements) | 원소마다 다름 | **OT (pre-MAC)** — 필수 |
 | **block_exp** (E8M0, shared) | 블록 전체 동일 | **FEDP (post-MAC)** — 수학적 동등 |
 
+#### Phase 8A Tile Register 인코딩 결정
+
+**설계 결정**: 32-bit word에 micro_exp를 별도 채널 없이 포함하기 위해 각 byte의 MSB를 micro_exp로 재정의.
+
+```
+Tile Register word 인코딩 (Phase 8A):
+  byte = {micro_exp[1b], INT7_mantissa[7b]}
+
+  word[31:24] = byte3: {micro_exp_pair1, m3[6:0]}
+  word[23:16] = byte2: {micro_exp_pair1, m2[6:0]}  ← byte3와 동일 micro_exp
+  word[15:8]  = byte1: {micro_exp_pair0, m1[6:0]}
+  word[7:0]   = byte0: {micro_exp_pair0, m0[6:0]}  ← byte1와 동일 micro_exp
+
+OT flatten: flat = sign_ext7(mantissa) << micro_exp
+  mantissa: INT7 [-64, 63]
+  micro_exp=0: flat = mantissa         → [-64, 63]  (INT8 범위 이내)
+  micro_exp=1: flat = mantissa × 2     → [-128, 126] (INT8 범위 이내, saturate 불필요)
+```
+
+**호환성**: `micro_exp_mode=0` 플래그로 기존 INT8 passthrough 유지 → 기존 TC backward compatible.
+
+#### Phase 8A 파이프라인 구조
+
+**OT 위치 결정**: Phase 8A에서는 현재 위치(pe_switch 뒤 INT path) 유지.
+FP path OT 지원은 FP WMMA에 scale context가 필요해지는 Phase 9+에서 검토.
+
+```
+[Phase 8A — 현재 위치 유지]
+pe_switch → OT(1cy) → VX_tcu_int(5cy) = 6cy 총
+
+OT 처리 (Phase 8A):
+  1. scale_ctx → exp_total (E8M0, global, post-MAC용)    ← Phase 7 기존
+  2. is_nop → rs1/rs2/rs3 zero-gate                     ← Phase 7 기존
+  3. micro_exp_mode=1 + WMMA: per-pair flatten           ← Phase 8A 신규
+     flat = sign_ext7(mantissa) << micro_exp
+  4. micro_exp_mode=0 + WMMA: INT8 passthrough           ← backward compat
+```
+
 #### 구현 단계
 
-**Phase 8A (주요 목표)**: micro-exp flatten → OT 위치 이동 + flatten 로직
+**Phase 8A (주요 목표)**: micro-exp flatten HW화 (OT 위치 유지)
+
+| 단계 | 파일 | 변경 내용 |
+|------|------|-----------|
+| 1 | `hw/rtl/VX_gpu_pkg.sv` | `tcu_args_t`에 `micro_exp_mode` 1-bit 추가 (padding -1) |
+| 2 | `hw/rtl/tcu/VX_tcu_operand_transformer.sv` | `flatten_word()` function + `do_flatten` 분기 |
+| 3 | `hw/rtl/tcu/tb_unit/tb_tcu_unit.sv` | Phase 8A TC 6개 추가 (micro_exp_mode=1) |
+| 4 | `hw/rtl/tcu/tb_wmma/tb_tcu_wmma.sv` | Phase 8A TC 6개 추가 |
+| 5 | `sim/simx/types.h` | `IntrTcuArgs.micro_exp_mode` 추가 |
+| 6 | `sim/simx/tensor_unit.cpp` | `ag_wmma()` micro_exp flatten 에뮬레이션 |
+
+변경 없는 파일: `VX_tcu_int.sv`, `VX_tcu_unit.sv`, `VX_tcu_fedp_int_scaled.sv`
+
+**Phase 8B (완료)**: block_exp까지 OT에서 처리 (INT8 saturated, FEDP 변경 없음)
 ```
-OT 입력: {micro_exp[1b], INT8} × elements + E8M0 block_exp
-OT 연산: A_flat[i] = A[i] << micro_exp[i]   → INT9
-OT 출력: rs1_data, rs2_data overwrite (INT9, 인터페이스 구조 유지)
-파이프라인: OT(micro flatten) → pe_switch → INT(MAC → block_exp shift) → Gather
+flat = sat8(sign_ext7(mantissa) << clamp(micro_exp + block_shift, -7, +7))
+→ exp_total = 0 (FEDP plain MAC, post-MAC shift 없음)
+→ FEDP/INT32 accumulator 변경 없음 (Option A)
 ```
 
-**Phase 8B (선택적, 향후 연구)**: block_exp까지 OT에서 처리
+Phase 8B 구현 파일:
+
+| # | 파일 | 변경 내용 |
+|---|------|-----------|
+| 1 | `hw/rtl/VX_gpu_pkg.sv` | `block_flatten_mode` 1-bit 추가 (padding: -31 → -32) |
+| 2 | `hw/rtl/tcu/VX_tcu_operand_transformer.sv` | `sat8_shift()`, `flatten_word_block()`, `do_block_flatten` 분기, `exp_total_ot=0` |
+| 3 | `hw/rtl/tcu/tb_unit/tb_tcu_unit.sv` | Phase 8B TC 6개 추가 (block_flatten_mode=1) |
+| 4 | `hw/rtl/tcu/tb_wmma/tb_tcu_wmma.sv` | Phase 8B TC 6개 (`TESTS_BFLAT` ifdef) |
+| 5 | `sim/simx/types.h` | `IntrTcuArgs.block_flatten_mode` 추가 |
+| 6 | `sim/simx/tensor_unit.cpp` | `extract_element()` block_flatten 분기, `ag_wmma()` sa/sb_actual |
+| 7 | `sim/simx/tensor_unit.h` | `ag_wmma()` `block_flatten_mode` 파라미터 |
+| 8 | `sim/simx/execute.cpp` | `ag_wmma()` 호출에 `block_flatten_mode` 전달 |
+
+변경 없는 파일: `VX_tcu_int.sv`, `VX_tcu_unit.sv`, `VX_tcu_fedp_int_scaled.sv`
+
+Phase 8B 핵심 파라미터:
+- `OT_SHIFT_MAX = 7`: combined shift clamp 범위 [-7, +7]
+- `sa_actual = scale_a - 127`, `sb_actual = scale_b - 127` (E8M0 actual exponent)
+- `block_flatten_mode=1` 시 `exp_total_ot = 0` (FEDP no-shift)
+- 우선순위: `do_block_flatten > do_flatten > passthrough`
+
+Phase 8B TC 설계:
 ```
-A_flat[i] = saturate(mantissa[i] << sa_actual), INT16
-→ FEDP exp_total 제거, plain MAC
-→ 단, INT16 × INT16 MAC으로 데이터패스 확장 필요
+TC 이름              | sa   | sb   | A tile           | 검증 포인트
+TC_block_neutral     | 127  | 127  | 0x01010101       | bsh=0, flat=1, d=8
+TC_block_a1          | 128  | 127  | 0x01010101       | sa_bsh=+1, flat=2, d=16
+TC_block_rshift      | 125  | 127  | 0x01010101       | sa_bsh=-2, shift=-2→flat=0, d=0
+TC_block_combined    | 128  | 128  | 0x81818181 (m=1, mexp=1) | total_shift=2, flat=4, d=128
+TC_block_sat         | 135  | 127  | 0x3F3F3F3F (m=63)| clamp+7, flat=127, d=1016
+TC_block_neg_rshift  | 120  | 127  | 0x81818181       | sa_bsh=-7, total=-6, flat=0, d=0
 ```
 
-#### Phase 8A OT 위치 변경
+#### Phase 8A TC 설계
+
 ```
-[Phase 7] pe_switch → OT → VX_tcu_int
-[Phase 8] OT → pe_switch → VX_tcu_int / VX_tcu_fp
-              (INT: micro-exp flatten, FP: bypass pass-through)
+TC 이름        | A micro_exp | B micro_exp | 검증 포인트
+tc_mexp_all0   | 0 (전부)    | 0 (전부)    | flatten identity (INT7→INT8)
+tc_mexp_a1_b0  | 1 (전부)    | 0 (전부)    | A ×2, B unchanged
+tc_mexp_a0_b1  | 0 (전부)    | 1 (전부)    | B ×2, A unchanged
+tc_mexp_mixed  | 교대 0/1    | 교대 1/0    | mixed pair micro_exp
+tc_mexp_max    | 1, m=63     | 1, m=63     | flat=126, INT8 no-sat
+tc_mexp_min    | 1, m=-64    | 1, m=-64    | flat=-128, INT8 min
+
+pack_mx9_word helper (TB):
+  byte = {micro_exp[1b], INT7_mantissa[7b]}
+  word = {byte3, byte2, byte1, byte0}  (pair1={byte3,byte2}, pair0={byte1,byte0})
 ```
 
-#### 구현 범위 (Phase 8A)
-- `VX_tcu_operand_transformer.sv`: pe_switch 앞으로 이동, micro-exp flatten 추가
-- `VX_tcu_unit.sv`: 배선 재구성
-- `VX_tcu_fedp_int_scaled.sv`: **변경 없음** (block_exp post-shift 유지)
-- simx `tensor_unit.cpp`: micro-exp flatten 에뮬레이션 추가
+---
 
+### Phase 9 — FP Path OT 확장: pe_switch 이전 OT 이동 + MX9→BF16 변환 ✅ 완료
+
+#### 목표
+
+OT를 pe_switch **이전**으로 이동하여 FP path(VX_tcu_fp)도 MX9 flatten 처리.
+`mx9_to_bf16()` 변환을 OT에서 수행, VX_tcu_fp에 BF16 직접 공급.
+LDSCALE hazard tracking을 FP / INT 양 path로 확장.
+
+#### 현재 vs 목표 아키텍처
+
+**현재 (Phase 8B)**:
+```
+pe_switch → pe_execute_if[1] → OT(1cy) → VX_tcu_int(5cy)
+pe_switch → pe_execute_if[0] → VX_tcu_fp(Ncy)   ← OT 없음, MX9 미처리
+```
+
+**Phase 9 목표**:
+```
+per_block_execute_if
+    → OT_v2(1cy)                          ← pe_switch 이전으로 이동
+        ├─ is_fp=0 (fmt_s[3]=0, INT): INT8 flatten  기존 동작 유지
+        └─ is_fp=1 (fmt_s[3]=1, FP):  mx9_to_bf16() 변환 (신규)
+    → pe_switch
+        ├─ pe=0 → VX_tcu_fp  (BF16 직접 수신, no further conversion)
+        └─ pe=1 → VX_tcu_int (INT8 + exp_total, 기존과 동일)
+```
+
+#### FP Path 현황 (설계 기준)
+
+| Backend | FP 포맷 | fmt_s_r (내부) | FEDP 레이턴시 |
+|---------|---------|---------------|--------------|
+| TCU_BHF | FP16, BF16 | 1, 2 | `(FMUL+FRND)+1+FRED+(FADD+FRND)` (N 의존) |
+| TCU_DPI | FP16, BF16 | 1, 2 | 4cy (FMUL=2 + FACC=2) |
+| TCU_DSP | FP16, BF16 | 1, 2 | `FCVT+FMUL+FRED+FADD` (~50+cy) |
+| — | FP8 | 없음 | 3개 backend 모두 미구현 |
+
+dispatch: `fmt_s[3]=1` → pe=0 (VX_tcu_fp). VX_tcu_fp 내부에서 `fmt_s[2:0]`만 FEDP로 전달.
+
+#### mx9_to_bf16() 변환 알고리즘
+
+```
+입력: byte = {micro_exp[1b], INT7[7b]},  block_exp: E8M0 uint8 (bias=127)
+출력: BF16 = {sign[1], exp8[8], mant7[7]}
+
+실제 값: INT7 × 2^(micro_exp) × 2^(block_exp - 127)
+
+1) sign      = m7[6]
+2) mag7      = |INT7|  (7-bit two's complement 부호 반전, 범위: 1~64)
+               sign=0: mag7 = m7[5:0]              (0x01..0x3F)
+               sign=1: mag7 = (~m7 + 1) & 0x7F      (0x01..0x40)
+               ※ INT7_MIN(-64): m7=0x40 → mag7=0x40  (6-bit 불가능, 7-bit 필수)
+3) lz        = count_leading_zeros(mag7) over 7 bits [0..6]
+4) bf16_exp  = block_exp + micro_exp + (6 - lz)
+5) norm      = (mag7 << lz) & 0x7F   [bit6 = implicit leading 1]
+   frac6     = norm[5:0]
+   bf16_mant = {frac6[5:0], 1'b0}   → 7-bit (BF16 stored mantissa)
+
+edge case:
+  m7 == 0x00        → BF16 = 0x0000 (zero)
+  bf16_exp ≤ 0      → flush to (signed) zero
+  bf16_exp ≥ 0xFF   → clamp to 0xFE (max normal BF16)
+
+packing (VX_tcu_fedp_bhf unpack 방식과 정합):
+  rs_data[t] = {bf16_elem1[15:0], bf16_elem0[15:0]}  (2 elements per 32-bit word)
+  (fedp: a_row16[2i] = a_row[i][15:0],  a_row16[2i+1] = a_row[i][31:16])
+```
+
+**FP path에서 exp_total 처리**: `mx9_to_bf16()`이 block_exp를 BF16 exponent에 embed →
+VX_tcu_fedp_bhf/dpi/dsp는 exp_total 입력 없음. OT 출력 payload의 exp_total 필드는 FP path에서 don't care (0 설정).
+
+**리스크**: priority encoder + 부호 처리 정확성 → **simx 구현 후 sweep 검증 필수**, RTL 구현은 그 이후.
+
+simx 검증 항목:
+```
+m7=0x00, mexp=0, block=127 → BF16 = 0x0000  (zero)
+m7=0x01, mexp=0, block=127 → BF16 = 0x3F80  (+1.0)
+m7=0x7F, mexp=0, block=127 → BF16 = 0xBF80  (-1.0,  INT7: 1111111 = -1)
+m7=0x01, mexp=1, block=127 → BF16 = 0x4000  (+2.0)
+m7=0x3F, mexp=1, block=127 → BF16 = 0x42FC  (+126.0, m=63, ×2)
+m7=0x40, mexp=1, block=127 → BF16 = 0xC300  (-128.0, INT7_MIN: mag7=0x40, lz=0, exp=134)
+m7=0x01, mexp=0, block=128 → BF16 = 0x4000  (+2.0,   block_exp +1 shift)
+```
+
+#### 이중 Feedback 채널 (Hazard 확장)
+
+**VX_tcu_fp에 추가할 output 포트** (VX_tcu_int Phase 7과 동일 패턴):
+```systemverilog
+`ifdef EXT_AG_TCU_ENABLE
+output wire                    ot_fedp_enable,
+output wire                    ot_result_fire,
+output wire [NW_WIDTH-1:0]     ot_result_wid
+`endif
+```
+
+**OT 내부 hazard 구조 변경**:
+```
+// 기존: wmma_inflight[NUM_WARPS] (INT 전용)
+// 신규: 두 개로 분리
+
+wmma_inflight_int[NUM_WARPS] ← int_result_fire, int_result_wid  (기존)
+wmma_inflight_fp [NUM_WARPS] ← fp_result_fire,  fp_result_wid   (신규)
+
+ldscale_hazard = is_nop_in
+    && (wmma_inflight_int[execute_if_in.data.wid] != 0
+     || wmma_inflight_fp [execute_if_in.data.wid] != 0)
+```
+
+Note: LDSCALE/LDTILE은 `pe_sel=1` 강제 (INT path) → FP delay pipe의 NOP 입력은 항상 0.
+FP delay pipe는 `wmma_inflight_fp` 카운터 전용으로만 사용.
+
+#### 이중 Delay Pipe
+
+```systemverilog
+// PIPE_LATENCY_FP: VX_tcu_fp 내부 FEDP_LATENCY + 1 (backend별 파라미터로 전달)
+localparam DELAY_DEPTH_INT = PIPE_LATENCY_INT;  // = 5 (기존)
+localparam DELAY_DEPTH_FP  = PIPE_LATENCY_FP;  // 신규, backend별 상이
+
+reg [DELAY_DEPTH_INT-1:0] ldscale_delay_pipe_int;  // enable: int_fedp_enable
+reg [DELAY_DEPTH_FP-1:0]  ldscale_delay_pipe_fp;   // enable: fp_fedp_enable
+```
+
+#### 파이프라인 레이턴시
+
+```
+INT path (변경 없음): OT(1cy) + VX_tcu_int(5cy) = 6cy
+FP  path (신규):      OT(1cy) + VX_tcu_fp(FEDP_LATENCY_FP + 1cy)
+
+TCU_UNIT_PIPE_LATENCY = max(INT path, FP path)  (scoreboard 기준)
+```
+
+#### 구현 단계
+
+#### 구현 완료 파일
+
+| # | 파일 | 변경 내용 |
+|---|------|-----------|
+| 1 | `hw/rtl/tcu/VX_tcu_fp.sv` | `ot_fedp_enable/ot_result_fire/ot_result_wid` output 추가 |
+| 2 | `sim/simx/tensor_unit.cpp` | `mx9_to_bf16()` 구현 + sweep 검증 (1289/1289 PASS); `bf16_to_float()` 추가; `ag_wmma()` FP path 브랜치 |
+| 3 | `hw/rtl/tcu/VX_tcu_operand_transformer.sv` | `is_fp = !fmt_s[3]`; `mx9_to_bf16_func()` RTL 함수; `mx9_word_to_bf16()`; 이중 wmma_inflight(INT/FP); PIPE_LATENCY_INT=5 |
+| 4 | `hw/rtl/tcu/VX_tcu_unit.sv` | OT를 pe_switch 이전으로 재배치; PIPE_LATENCY_FP 로컬 계산; FP feedback 배선 |
+| 5 | `hw/rtl/VX_gpu_pkg.sv` | `tcu_args_t`에 `mx9_fp_mode` 1-bit 추가 (padding: -32 → -33) |
+| 6 | `sim/simx/types.h` | `IntrTcuArgs.mx9_fp_mode` 추가 |
+| 7 | `sim/simx/execute.cpp` | `ag_wmma()` 호출에 `mx9_fp_mode` 전달 |
+| 8 | `hw/rtl/tcu/tb_wmma/tb_tcu_wmma.sv` | `ref_mx9_to_bf16()`, `bf16_to_real()`, `fp32_to_real()`, `ref_d_fp()`, `run_wmma_fp()` 추가; `TESTS_FPFLAT` 6 TC |
+| 9 | `hw/rtl/tcu/tb_wmma/Makefile` | `test-fpflat` / `test-fpflat-nt8` 타겟 추가 |
+
+변경 없는 파일: `VX_tcu_int.sv`, `VX_tcu_fedp_int_scaled.sv`, `VX_tcu_fedp_bhf.sv`
+
+#### fmt_s[3] 핵심 주의사항
+```
+fmt_s[3]=0 (FP: BF16_ID=2, FP16_ID=1) → pe_sel=0 → VX_tcu_fp → BHF BF16 MAC
+fmt_s[3]=1 (INT: I8_ID=9, I32_ID=8)   → pe_sel=1 → VX_tcu_int → INT8 MAC
+is_fp = !fmt_s[3]  (OT 내부에서 반드시 부정으로 판별)
+```
+
+#### Phase 9 TESTS_FPFLAT TC 구성
+| TC | A byte | B byte | block_exp | 기대값 (K_STEPS=2) |
+|----|--------|--------|-----------|-------------------|
+| TC_fp_zero | 0x00 (BF16=0.0) | 0x01 (BF16=1.0) | 127 | d=0.0 |
+| TC_fp_identity | 0x01 (BF16=1.0) | 0x01 | 127 | d=8.0 (4×K) |
+| TC_fp_mexp1 | 0x81 (mexp=1→BF16=2.0) | 0x81 | 127 | d=32.0 |
+| TC_fp_block_shift | 0x01→BF16=2.0 (block=128) | 0x01 | 128 | d=32.0 |
+| TC_fp_neg | 0x7F (INT7=-1→BF16=-1.0) | 0x01 | 127 | d=-8.0 |
+| TC_fp_nonzero_c | 0x01→1.0 | 0x01 | 127, C=4.0 | d=12.0 |
 
 ---
 
@@ -482,14 +764,17 @@ A_flat[i] = saturate(mantissa[i] << sa_actual), INT16
 | 1 | VX_tcu_fedp_int_scaled | `tb/tb_fedp_int_scaled.sv` | **22/22 PASS** |
 | 2 | VX_tcu_int (+operand_xformer) | `tb_int/tb_tcu_int.sv` | **10/10 PASS** |
 | 3 | VX_tcu_uops | `tb_uops/tb_tcu_uops.sv` | **129/129 PASS** |
-| 4 | VX_tcu_unit | `tb_unit/tb_tcu_unit.sv` | **14/14 PASS** (NT=4+8) |
-| 5 | VX_tcu_unit (K-acc) | `tb_wmma/tb_tcu_wmma.sv` | **20/20 PASS** NT=4, **20/20 PASS** NT=8 |
+| 4 | VX_tcu_unit | `tb_unit/tb_tcu_unit.sv` | **26/26 PASS** (NT=4+8, Phase 8A/8B TC 포함) |
+| 5 | VX_tcu_unit (K-acc) | `tb_wmma/tb_tcu_wmma.sv` | safe **9/9**, mexp **6/6**, bflat **6/6**, **fpflat 6/6** (NT=4+8) |
 | 6 | VX_execute+VX_commit | `tb_execute/tb_execute.sv` | **10/10 PASS** |
 | 7 | VX_issue+...+VX_commit | `tb_issue/tb_issue.sv` | **5/5 PASS** |
 | 8 | VX_decode+...+VX_commit | `tb_decode/tb_decode.sv` | **7/7 PASS** |
 | E2E | sgemm_ag_tcu kernel | simx driver | **PASSED** (exp=0, +2, -1) |
 
-**모든 L1–L8 회귀 테스트 통과 (Phase 5 E8M0 + Phase 4④ LDTILE 적용 후)**
+**모든 L1–L8 회귀 테스트 통과 (Phase 9 FP path MX9→BF16 포함)**
+
+> **NT=8 Verilator 주의**: 각 Phase TC는 별도 ifdef로 분리. `make test-all-nt8` 순차 실행 필수 (동일 obj_dir 병렬 빌드 금지).
+> Phase 8B: `TESTS_BFLAT` / `test-bflat-nt8`. Phase 9: `TESTS_FPFLAT` / `test-fpflat-nt8`.
 
 ### 테스트 패턴 (E8M0 기준)
 
@@ -573,8 +858,10 @@ void TensorUnit::Impl::ag_wmma(
 | `VX_gpu_pkg.sv` | `hw/rtl/` | `tcu_op_e` 2-bit (WMMA/LDSCALE/LDTILE); `tcu_args_t` + `tile_type[1:0]` | ✅ |
 | `VX_tcu_scale_ctx.sv` | `hw/rtl/tcu/` | Per-warp scale register file (8-bit E8M0 × 2) | ✅ |
 | `VX_tcu_fedp_int_scaled.sv` | `hw/rtl/tcu/` | FEDP: MAC + 10-bit signed bidirectional shift + sat; `EXP_TOTAL=10` | ✅ |
-| `VX_tcu_int.sv` | `hw/rtl/tcu/` | LDSCALE/LDTILE/WMMA 분기; `is_ldtile`; `nop_delay_pipe`; hazard lock | ✅ |
-| `VX_tcu_unit.sv` | `hw/rtl/tcu/` | `pe_sel`: LDSCALE/LDTILE → INT path 강제; Phase 7에서 OT stage 삽입 | 구현 중 |
+| `VX_tcu_int.sv` | `hw/rtl/tcu/` | Phase 7: pure FEDP; feedback 포트 (`ot_fedp_enable/result_fire/result_wid`) | ✅ |
+| `VX_tcu_operand_transformer.sv` | `hw/rtl/tcu/` | Phase 9: pe_switch 이전으로 이동; is_fp=!fmt_s[3]; mx9_to_bf16_func(); 이중 wmma_inflight(INT/FP); PIPE_LATENCY_INT=5 | ✅ |
+| `VX_tcu_fp.sv` | `hw/rtl/tcu/` | FP FEDP wrapper (TCU_BHF/DPI/DSP); Phase 9: ot_fedp_enable/ot_result_fire/ot_result_wid output 추가 | ✅ |
+| `VX_tcu_unit.sv` | `hw/rtl/tcu/` | Phase 9: OT를 pe_switch 이전으로 이동; PIPE_LATENCY_FP 로컬 계산; FP feedback 배선 | ✅ |
 | `VX_uop_sequencer.sv` | `hw/rtl/core/` | LDSCALE/LDTILE uop 확장 제외 | ✅ |
 | `VX_tcu_uops.sv` | `hw/rtl/tcu/` | uop 시퀀서: `tcu_op=WMMA` 전달 | ✅ |
 | `VX_decode.sv` | `hw/rtl/core/` | WMMA, LDSCALE, LDTILE 디코딩 | ✅ |

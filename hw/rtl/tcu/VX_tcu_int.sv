@@ -52,7 +52,7 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 );
     `UNUSED_SPARAM (INSTANCE_ID);
 
-    localparam MDATA_WIDTH  = UUID_WIDTH + NW_WIDTH + PC_BITS + NUM_REGS_BITS;
+    localparam MDATA_WIDTH  = UUID_WIDTH + NW_WIDTH + PC_BITS + NUM_REGS_BITS + 1;  // +1 for wb
     localparam MUL_LATENCY  = 2;
     localparam ADD_LATENCY  = 1;
     localparam ACC_LATENCY  = $clog2(TCU_TC_K) * ADD_LATENCY + ADD_LATENCY;
@@ -77,7 +77,8 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         execute_if.data.uuid,
         execute_if.data.wid,
         execute_if.data.PC,
-        execute_if.data.rd
+        execute_if.data.rd,
+        execute_if.data.wb
     };
 
     wire execute_fire = execute_if.valid && execute_if.ready;
@@ -108,8 +109,10 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // Feedback to OT (Phase 7)
 `ifdef EXT_AG_TCU_ENABLE
+    // mdata_queue packing: {uuid, wid, PC, rd, wb}
+    // wb is now at bit[0], so wid is shifted up by 1 compared to original {uuid, wid, PC, rd}.
     wire [NW_WIDTH-1:0] result_wid_w =
-        mdata_queue_dout[NW_WIDTH + PC_BITS + NUM_REGS_BITS - 1 : PC_BITS + NUM_REGS_BITS];
+        mdata_queue_dout[NW_WIDTH + PC_BITS + NUM_REGS_BITS : PC_BITS + NUM_REGS_BITS + 1];
 
     assign ot_fedp_enable = fedp_enable;
     assign ot_result_fire = result_fire;
@@ -230,7 +233,6 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Non-AG build: these are used in the else branch above
 `endif
 
-    assign result_if.data.wb  = 1;
     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
     assign result_if.data.data  = d_val;
     assign result_if.data.pid = 0;
@@ -241,7 +243,8 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         result_if.data.uuid,
         result_if.data.wid,
         result_if.data.PC,
-        result_if.data.rd
+        result_if.data.rd,
+        result_if.data.wb
     } = mdata_queue_dout;
 
 endmodule

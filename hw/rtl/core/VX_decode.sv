@@ -518,13 +518,16 @@ module VX_decode import VX_gpu_pkg::*; #(
                 `ifdef EXT_TCU_ENABLE
                     7'h02: begin
                         case (funct3)
-                            3'h0: begin // WMMA
+                            3'h0: begin // WMMA (regular TCU, exp_a/exp_b=0)
                                 ex_type = EX_TCU;
                                 op_type = INST_OP_BITS'(INST_TCU_WMMA);
                                 op_args.tcu.fmt_s  = rs1[3:0];
                                 op_args.tcu.fmt_d  = rd[3:0];
                                 op_args.tcu.step_m = '0;
                                 op_args.tcu.step_n = '0;
+                            `ifdef EXT_AG_TCU_ENABLE
+                                op_args.tcu.tcu_op = TCU_OP_WMMA;
+                            `endif
                                 `USED_IREG (rd);
                                 `USED_IREG (rs1);
                                 `USED_IREG (rs2);
@@ -534,7 +537,49 @@ module VX_decode import VX_gpu_pkg::*; #(
                         endcase
                     end
                 `endif
+                `ifdef EXT_AG_TCU_ENABLE
+                    // AG-TCU LDSCALE / LDTILE: funct7[2:0] == 3'b110 or 3'b111
+                    default: begin
+                        if (funct7[2:0] == 3'b110) begin
+                            // LDSCALE: loads E8M0 scale context into per-warp VX_tcu_scale_ctx.
+                            // rs1 = integer reg packed {scale_b[7:0], scale_a[7:0]}; rd = x0.
+                            case (funct3)
+                                3'h0: begin // LDSCALE
+                                    ex_type = EX_TCU;
+                                    op_type = INST_OP_BITS'(INST_TCU_WMMA);
+                                    op_args.tcu.fmt_s  = rs1[3:0];
+                                    op_args.tcu.fmt_d  = rd[3:0];
+                                    op_args.tcu.step_m = '0;
+                                    op_args.tcu.step_n = '0;
+                                    op_args.tcu.tcu_op   = TCU_OP_LDSCALE;
+                                    op_args.tcu.tile_type = '0;
+                                    `USED_IREG (rd);
+                                    `USED_IREG (rs1);
+                                end
+                                default:;
+                            endcase
+                        end else if (funct7[2:0] == 3'b111) begin
+                            // LDTILE: tile-type context load; actual data via FLW (HW-transparent).
+                            // funct7[4:3] = tile_type (0=TILE_A, 1=TILE_B, 2=TILE_C).
+                            case (funct3)
+                                3'h0: begin // LDTILE
+                                    ex_type = EX_TCU;
+                                    op_type = INST_OP_BITS'(INST_TCU_WMMA);
+                                    op_args.tcu.fmt_s  = '0;
+                                    op_args.tcu.fmt_d  = '0;
+                                    op_args.tcu.step_m = '0;
+                                    op_args.tcu.step_n = '0;
+                                    op_args.tcu.tcu_op   = TCU_OP_LDTILE;
+                                    op_args.tcu.tile_type = funct7[4:3];
+                                    `USED_IREG (rs1);
+                                end
+                                default:;
+                            endcase
+                        end
+                    end
+                `else
                     default:;
+                `endif
                 endcase
             end
             default:;

@@ -33,7 +33,13 @@ module VX_uop_sequencer import
 
 `ifdef EXT_TCU_ENABLE
 
+  `ifdef EXT_AG_TCU_ENABLE
+    assign is_uop_input = (input_if.data.ex_type == EX_TCU && input_if.data.op_type == INST_TCU_WMMA)
+                       && (input_if.data.op_args.tcu.tcu_op != TCU_OP_LDSCALE)
+                       && (input_if.data.op_args.tcu.tcu_op != TCU_OP_LDTILE);
+  `else
     assign is_uop_input = (input_if.data.ex_type == EX_TCU && input_if.data.op_type == INST_TCU_WMMA);
+  `endif
 
     VX_tcu_uops tcu_uops (
         .clk     (clk),
