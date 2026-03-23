@@ -32,12 +32,12 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam PE_COUNT   = 2;
 
     // PIPE_LATENCY for scoreboard.
-    // Phase 9: OT(1cy) is before pe_switch (handles both INT and FP paths).
-    //   INT path: OT(1) + VX_tcu_int(5) = 6cy
+    // Phase 10: OT(1cy) is before pe_switch (handles both INT and FP paths).
+    //   INT path: OT(1) + VX_tcu_int(6) = 7cy  [FEDP 5cy + mdata 1cy]
     //   FP  path: OT(1) + VX_tcu_fp(FEDP_LATENCY_FP+1)  [backend-dependent]
 /* verilator lint_off UNUSEDPARAM */
 `ifdef EXT_AG_TCU_ENABLE
-    localparam TCU_UNIT_PIPE_LATENCY = 6;  // Scoreboard uses INT path latency (conservative)
+    localparam TCU_UNIT_PIPE_LATENCY = 7;  // Scoreboard uses INT path latency (conservative)
 `else
     localparam TCU_UNIT_PIPE_LATENCY = 5;  // Without OT stage
 `endif
@@ -104,7 +104,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         wire [NW_WIDTH-1:0] ot_result_wid;
 
         VX_tcu_operand_transformer #(
-            .PIPE_LATENCY_INT (5)  // VX_tcu_int internal: FEDP(4)+mdata(1)
+            .PIPE_LATENCY_INT (6)  // VX_tcu_int internal: FEDP(5)+mdata(1)
         ) operand_xformer (
             .clk            (clk),
             .reset          (reset),
@@ -115,10 +115,12 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .result_wid     (ot_result_wid)
         );
 
-        // LDSCALE/LDTILE always → INT path (pe_sel=1); evaluated on OT output.
+        // LDSCALE/LDTILE/LDMICRO always → INT path (pe_sel=1); evaluated on OT output.
+        // Note: MX9 WMMA fmt_s is patched to I8_ID (bit3=1) by OT → also routes to INT.
         wire pe_sel_w = ot_execute_if.data.op_args.tcu.fmt_s[3]
                       | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDSCALE)
-                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDTILE);
+                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDTILE)
+                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDMICRO);
 
         VX_pe_switch #(
             .PE_COUNT    (PE_COUNT),

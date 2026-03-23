@@ -108,6 +108,7 @@ TCU_SRCS := \
     $(TCU_DIR)/VX_tcu_fedp_int.sv         \
     $(TCU_DIR)/VX_tcu_fedp_int_scaled.sv  \
     $(TCU_DIR)/VX_tcu_scale_ctx.sv        \
+    $(TCU_DIR)/VX_tcu_micro_ctx.sv        \
     $(TCU_DIR)/VX_tcu_operand_transformer.sv  \
     $(TCU_DIR)/VX_tcu_fp.sv               \
     $(TCU_DIR)/VX_tcu_int.sv              \

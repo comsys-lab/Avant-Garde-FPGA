@@ -2,14 +2,14 @@
 ##
 ## Tests the full TCU pipeline with all UOPS (K-accumulation):
 ##   dispatch_if → VX_dispatch_unit → VX_pe_switch
-##     → VX_tcu_int (AG-TCU INT path)
+##     → VX_tcu_operand_transformer → VX_tcu_fp / VX_tcu_int
 ##   → VX_gather_unit → commit_if
-##   (NT=4 default: UOPS=16, TC_M=2, TC_N=2, TC_K=2)
 ##
 ## Usage:
-##   make          - build and run
-##   make wave     - run with VCD trace (wave_wmma.vcd)
-##   make clean    - remove build artifacts
+##   make        - build and run (NT=4 default)
+##   make nt8    - build and run with NT=8
+##   make wave   - run with VCD trace
+##   make clean  - remove build artifacts
 
 RTL_DIR    := $(abspath ../..)
 LIBS_DIR   := $(RTL_DIR)/libs
@@ -72,6 +72,7 @@ TCU_SRCS := \
     $(TCU_DIR)/VX_tcu_fedp_int.sv         \
     $(TCU_DIR)/VX_tcu_fedp_int_scaled.sv  \
     $(TCU_DIR)/VX_tcu_scale_ctx.sv        \
+    $(TCU_DIR)/VX_tcu_micro_ctx.sv        \
     $(TCU_DIR)/VX_tcu_operand_transformer.sv  \
     $(TCU_DIR)/VX_tcu_fp.sv               \
     $(TCU_DIR)/VX_tcu_int.sv              \
@@ -106,13 +107,7 @@ VL_FLAGS  += -Wno-PINMISSING -Wno-IMPLICIT
 VL_FLAGS  += -Wno-GENUNNAMED
 
 VL_FLAGS  += --x-initial unique --x-assign unique
-# --output-split 1000000: prevents Verilator from splitting the initial-block
-# timing coroutine into sub-functions (DepSet__1.cpp, __2.cpp, ...).
-# Verilator 5.028 has a sub-function dispatcher bug that fires whenever the
-# coroutine is split into 3+ segments (segfault / heap corruption).  Keeping
-# everything in a single __0.cpp avoids the dispatcher entirely.
-# -O0 is required because a single large coroutine function at -O1/-O2 triggers
-# a g++ register-pressure bug (32→64-bit zero-extension of rax used as pointer).
+# Prevent Verilator 5.028 coroutine-split dispatcher bug (SIGSEGV on 3+ splits)
 VL_FLAGS  += --output-split 1000000
 VL_FLAGS  += --CFLAGS "-g -O0"
 
@@ -137,15 +132,13 @@ VL_FLAGS  += --top-module tb_tcu_wmma
 VL_FLAGS  += --Mdir $(BUILD_DIR)
 VL_FLAGS  += -o Vtb_tcu_wmma
 
-# Per-group test define (set by test-safe / test-stream / test-sat)
 VL_FLAGS_EXTRA ?=
 VL_FLAGS       += $(VL_FLAGS_EXTRA)
 
 # --------------------------------------------------------------------------
 # Targets
 # --------------------------------------------------------------------------
-.PHONY: all run wave clean test-safe test-stream test-sat test-all \
-       test-safe-nt8 test-stream-nt8 test-sat-nt8 test-all-nt8
+.PHONY: all run wave clean nt8
 
 all: run
 
@@ -164,39 +157,7 @@ wave: $(TARGET)
 clean:
 	rm -rf $(BUILD_DIR) $(VCD_FILE)
 
-# --------------------------------------------------------------------------
-# Per-group test targets (each does a clean rebuild with its ifdef guard)
-# Splits the initial block so Verilator generates ≤1 timing coroutine file,
-# working around the Verilator 5.028 sub-coroutine dispatcher bug that fires
-# when 7+ timing files are generated (≥199K total C++ lines).
-# --------------------------------------------------------------------------
-test-safe:
+# NT=8 target
+nt8:
 	$(MAKE) clean
-	$(MAKE) run VL_FLAGS_EXTRA="-DTESTS_SAFE"
-
-test-stream:
-	$(MAKE) clean
-	$(MAKE) run VL_FLAGS_EXTRA="-DTESTS_STREAM"
-
-test-sat:
-	$(MAKE) clean
-	$(MAKE) run VL_FLAGS_EXTRA="-DTESTS_SAT"
-
-test-all: test-safe test-stream test-sat
-
-# --------------------------------------------------------------------------
-# NT=8 test targets (same ifdef groups, compiled with NUM_THREADS=8)
-# --------------------------------------------------------------------------
-test-safe-nt8:
-	$(MAKE) clean
-	$(MAKE) run VL_FLAGS_EXTRA="-DTESTS_SAFE -DNUM_THREADS=8"
-
-test-stream-nt8:
-	$(MAKE) clean
-	$(MAKE) run VL_FLAGS_EXTRA="-DTESTS_STREAM -DNUM_THREADS=8"
-
-test-sat-nt8:
-	$(MAKE) clean
-	$(MAKE) run VL_FLAGS_EXTRA="-DTESTS_SAT -DNUM_THREADS=8"
-
-test-all-nt8: test-safe-nt8 test-stream-nt8 test-sat-nt8
+	$(MAKE) run VL_FLAGS_EXTRA="-DNUM_THREADS=8"

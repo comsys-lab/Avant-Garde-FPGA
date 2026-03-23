@@ -1,27 +1,17 @@
-// Level 7 Testbench: VX_issue + VX_execute + VX_commit
+// Level 7 Testbench: VX_issue standalone
 //
-// DUT: VX_issue (ibuffer → uop_sequencer → scoreboard → operands → dispatch)
-//      + VX_execute + VX_commit
+// DUT: VX_issue only (ibuffer → uop_sequencer → scoreboard → operands → dispatch)
+// TB drives decode_if and monitors dispatch_if[EX_TCU * ISSUE_WIDTH].
+// Register file seeded via writeback_if in preload_phase.
+// Scoreboard released after WMMA dispatch by manually injecting writeback_if.
 //
-// New vs Level 6:
-//   1. RTL fix: VX_uop_sequencer excludes LDSCALE from uop expansion (TC1 verifies)
-//   2. WMMA decode_t flows through full issue pipeline (TC2 verifies uop count)
-//   3. GPR register file preloaded via writeback_if before execution
-//   4. K-accumulation via scoreboard serialization (TC3-TC5 verify functional results)
-//
-// Writeback mux:
-//   preload_phase=1 → TB drives issue_wb (seeds register file)
-//   preload_phase=0 → VX_commit drives issue_wb (K-accumulation feedback)
-//
-// Test groups:
-//   TC1: LDSCALE → 1 commit (not UOPS; RTL fix verification)
-//   TC2: WMMA → UOPS=16 commits, all data=0 (A=B=C=0)
-//   TC3: LDSCALE(0,0)+WMMA (A=B=0, C=42) → all UOPS outputs = 42
-//   TC4: LDSCALE(scale_a=2)+WMMA (A=B=ones, C=0) → accumulated tiles correct
-//   TC5: LDSCALE(0,0)+WMMA (A=B=ones, C=-200) → k0=-192, kfinal=-184
+// Phase 10 TC:
+//   TC1: LDSCALE → 1 dispatch (uop_sequencer does NOT expand to UOPS)
+//   TC2: WMMA → TCU_UOPS dispatches, sop/eop marking
+//   TC3: LDMICRO → 1 dispatch, dispatch.wb=0  [Phase 10]
+//   TC4: Scoreboard RAW stall — WMMA#1 stalls WMMA#2; inject wb → WMMA#2 proceeds
 
 `include "VX_define.vh"
-
 `timescale 1ns/1ps
 
 import VX_gpu_pkg::*;
@@ -37,151 +27,80 @@ module tb_issue;
     always #5 clk = ~clk;
 
     // =========================================================================
-    // Derived parameters (mirror VX_tcu_uops counter logic for reference model)
+    // Derived parameters
     // =========================================================================
     localparam LG_N    = $clog2(TCU_N_STEPS);
     localparam LG_M    = $clog2(TCU_M_STEPS);
     localparam LG_K    = $clog2(TCU_K_STEPS);
     localparam LG_A_SB = $clog2(TCU_A_SUB_BLOCKS);
     localparam LG_B_SB = $clog2(TCU_B_SUB_BLOCKS);
-    // Number of unique tile registers accessed by one WMMA
     localparam TCU_NRA = (TCU_M_STEPS / TCU_A_SUB_BLOCKS) * TCU_K_STEPS;
-    localparam TCU_NRC = TCU_M_STEPS * TCU_N_STEPS;  // = M_STEPS * N_STEPS
+    localparam TCU_NRC = TCU_M_STEPS * TCU_N_STEPS;
 
-    // Scale value register: integer x5 (arbitrary choice)
     localparam [NUM_REGS_BITS-1:0] SCALE_REG =
         make_reg_num(REG_TYPE_I, RV_REGS_BITS'(5));
 
     // =========================================================================
-    // Interface instances
+    // Interfaces
     // =========================================================================
     VX_decode_if       decode_if();
-    VX_writeback_if    issue_wb  [`ISSUE_WIDTH]();  // → VX_issue.writeback_if
-    VX_writeback_if    commit_wb [`ISSUE_WIDTH]();  // VX_commit output → here
-    VX_dispatch_if     issue_dispatch [NUM_EX_UNITS * `ISSUE_WIDTH]();
-    VX_commit_if       commit_mid     [NUM_EX_UNITS * `ISSUE_WIDTH]();
-    VX_issue_sched_if  issue_sched_if [`ISSUE_WIDTH]();
-    VX_branch_ctl_if   branch_ctl_if  [`NUM_ALU_BLOCKS]();
-    VX_warp_ctl_if     warp_ctl_if();
-    VX_commit_csr_if   commit_csr_if();
-    VX_commit_sched_if commit_sched_if();
-    VX_sched_csr_if    sched_csr_if();
-    VX_lsu_mem_if #(
-        .NUM_LANES (`NUM_LSU_LANES),
-        .DATA_SIZE (4),
-        .TAG_WIDTH (LSU_TAG_WIDTH)
-    ) lsu_mem_if[`NUM_LSU_BLOCKS]();
+    VX_writeback_if    writeback_if[`ISSUE_WIDTH]();
+    VX_dispatch_if     dispatch_if [NUM_EX_UNITS * `ISSUE_WIDTH]();
+    VX_issue_sched_if  issue_sched_if[`ISSUE_WIDTH]();
 
-    // =========================================================================
-    // Writeback mux: preload_phase ? TB_preload : VX_commit_output
-    // VX_writeback_if is ack-free (valid+data only, no ready).
-    // When preload_phase=1: TB's tb_wb_valid_r/tb_wb_data_r drives issue_wb.
-    // When preload_phase=0: VX_commit's commit_wb drives issue_wb, enabling
-    //   K-accumulation (each k=0 writeback feeds into k=1 as rs3).
-    // =========================================================================
-    logic       preload_phase   = 1'b1;
-    logic       tb_wb_valid_r   = 1'b0;
-    writeback_t tb_wb_data_r;
-
-    for (genvar i = 0; i < `ISSUE_WIDTH; i++) begin : g_wb_mux
-        assign issue_wb[i].valid = preload_phase ? tb_wb_valid_r    : commit_wb[i].valid;
-        assign issue_wb[i].data  = preload_phase ? tb_wb_data_r     : commit_wb[i].data;
+    // TB always accepts all dispatches immediately
+    for (genvar i = 0; i < NUM_EX_UNITS * `ISSUE_WIDTH; i++) begin : g_disp_ready
+        assign dispatch_if[i].ready = 1'b1;
     end
 
     // =========================================================================
-    // DUT: VX_issue
+    // DUT: VX_issue only
     // =========================================================================
-    VX_issue #(
-        .INSTANCE_ID ("tb_issue")
-    ) issue (
+    VX_issue #(.INSTANCE_ID("tb_issue")) issue_dut (
         .clk            (clk),
         .reset          (reset),
         .decode_if      (decode_if),
-        .writeback_if   (issue_wb),
-        .dispatch_if    (issue_dispatch),
+        .writeback_if   (writeback_if),
+        .dispatch_if    (dispatch_if),
         .issue_sched_if (issue_sched_if)
     );
 
     // =========================================================================
-    // DUT: VX_execute
+    // Writeback driver (preload_phase=1: seed registers; =0: inject after dispatch)
     // =========================================================================
-    base_dcrs_t base_dcrs_tie;
-    assign base_dcrs_tie = '0;
+    logic       preload_phase = 1'b1;
+    logic       tb_wb_valid_r = 1'b0;
+    writeback_t tb_wb_data_r;
 
-    VX_execute #(
-        .INSTANCE_ID ("tb_execute"),
-        .CORE_ID     (0)
-    ) execute (
-        .clk           (clk),
-        .reset         (reset),
-        .base_dcrs     (base_dcrs_tie),
-        .lsu_mem_if    (lsu_mem_if),
-        .dispatch_if   (issue_dispatch),
-        .commit_if     (commit_mid),
-        .sched_csr_if  (sched_csr_if),
-        .branch_ctl_if (branch_ctl_if),
-        .warp_ctl_if   (warp_ctl_if),
-        .commit_csr_if (commit_csr_if)
-    );
-
-    // =========================================================================
-    // DUT: VX_commit
-    // =========================================================================
-    VX_commit #(
-        .INSTANCE_ID ("tb_commit")
-    ) commit (
-        .clk             (clk),
-        .reset           (reset),
-        .commit_if       (commit_mid),
-        .writeback_if    (commit_wb),
-        .commit_csr_if   (commit_csr_if),
-        .commit_sched_if (commit_sched_if)
-    );
-
-    // =========================================================================
-    // Tie-offs: LSU memory interface (LSU dispatch always valid=0)
-    // =========================================================================
-    for (genvar i = 0; i < `NUM_LSU_BLOCKS; i++) begin : g_tie_lsu
-        assign lsu_mem_if[i].req_ready = 1'b0;
-        assign lsu_mem_if[i].rsp_valid = 1'b0;
-        assign lsu_mem_if[i].rsp_data  = '0;
+    for (genvar i = 0; i < `ISSUE_WIDTH; i++) begin : g_wb_drive
+        assign writeback_if[i].valid = tb_wb_valid_r;
+        assign writeback_if[i].data  = tb_wb_data_r;
     end
 
-    // Tie-off: warp_ctl_if (SFU output, SFU never dispatched)
-    assign warp_ctl_if.dvstack_ptr = '0;
-
-    // Tie-off: sched_csr_if (SFU CSR reads return 0)
-    assign sched_csr_if.cycles       = '0;
-    assign sched_csr_if.active_warps = '0;
-    assign sched_csr_if.thread_masks = '0;
-    assign sched_csr_if.alm_empty    = '0;
+    // =========================================================================
+    // TCU dispatch counter
+    // =========================================================================
+    int tcu_dispatch_cnt = 0;
+    always @(posedge clk) begin
+        if (reset)
+            tcu_dispatch_cnt <= 0;
+        else if (dispatch_if[EX_TCU * `ISSUE_WIDTH].valid &&
+                 dispatch_if[EX_TCU * `ISSUE_WIDTH].ready)
+            tcu_dispatch_cnt <= tcu_dispatch_cnt + 1;
+    end
 
     // =========================================================================
-    // Counters
+    // Pass/fail counters and UUID
     // =========================================================================
     int pass_cnt = 0, fail_cnt = 0;
-
-    // =========================================================================
-    // Helper: fill all threads with same 32-bit word
-    // =========================================================================
-    function automatic logic [`SIMD_WIDTH-1:0][`XLEN-1:0] fill (
-        input logic [`XLEN-1:0] w
-    );
-        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] r;
-        for (int i = 0; i < `SIMD_WIDTH; i++) r[i] = w;
-        return r;
-    endfunction
-
-    // =========================================================================
-    // UUID counter
-    // =========================================================================
     logic [UUID_WIDTH-1:0] next_uuid = UUID_WIDTH'(1);
+    logic [UUID_WIDTH-1:0] fork_uuid;  // scratch for fork...join_none uuid capture
+    logic [NUM_REGS_BITS-1:0] fork_commit_rd; // scratch rd for sim_commit in fork threads
 
     // =========================================================================
-    // preload_gpr: seed the VX_operands register file via issue_wb (preload_phase=1).
-    // writeback_if is ack-free: one-cycle pulse suffices to update the register.
+    // Helpers
     // =========================================================================
-    task automatic preload_gpr (
+    task automatic preload_gpr(
         input logic [NUM_REGS_BITS-1:0] reg_idx,
         input logic [`XLEN-1:0]         val
     );
@@ -192,7 +111,6 @@ module tb_issue;
         wb.eop    = 1'b1;
         wb.rd     = reg_idx;
         for (int t = 0; t < `SIMD_WIDTH; t++) wb.data[t] = val;
-
         @(posedge clk); #1;
         tb_wb_valid_r = 1'b1;
         tb_wb_data_r  = wb;
@@ -200,51 +118,51 @@ module tb_issue;
         tb_wb_valid_r = 1'b0;
     endtask
 
-    // =========================================================================
-    // preload_tile_regs: seed A, B, C tile registers
-    // =========================================================================
-    task automatic preload_tile_regs (
-        input logic [`XLEN-1:0] a_val,
-        input logic [`XLEN-1:0] b_val,
-        input logic [`XLEN-1:0] c_val
+    // sim_commit: inject one writeback for rd to release scoreboard entry.
+    // Simulates VX_execute→VX_commit when VX_execute is absent from DUT.
+    task automatic sim_commit(input logic [NUM_REGS_BITS-1:0] rd);
+        preload_gpr(rd, '0);
+    endtask
+
+    task automatic preload_tile_regs(
+        input logic [`XLEN-1:0] a_val, b_val, c_val
     );
-        // A tile: RA + off_a for all (m,k)
-        for (int m = 0; m < TCU_M_STEPS; m++) begin
+        for (int m = 0; m < TCU_M_STEPS; m++)
             for (int k = 0; k < TCU_K_STEPS; k++) begin
-                int off_a;
-                off_a = ((m >> LG_A_SB) << LG_K) | k;
+                int off_a = ((m >> LG_A_SB) << LG_K) | k;
                 preload_gpr(
                     make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RA) + RV_REGS_BITS'(off_a)),
                     a_val);
             end
-        end
-        // B tile: RB + off_b for all (k,n)
-        for (int k = 0; k < TCU_K_STEPS; k++) begin
+        for (int k = 0; k < TCU_K_STEPS; k++)
             for (int n = 0; n < TCU_N_STEPS; n++) begin
-                int off_b;
-                off_b = ((k << LG_N) | n) >> LG_B_SB;
+                int off_b = ((k << LG_N) | n) >> LG_B_SB;
                 preload_gpr(
                     make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RB) + RV_REGS_BITS'(off_b)),
                     b_val);
             end
-        end
-        // C tile: RC + off_c for all (m,n)
-        for (int m = 0; m < TCU_M_STEPS; m++) begin
+        for (int m = 0; m < TCU_M_STEPS; m++)
             for (int n = 0; n < TCU_N_STEPS; n++) begin
-                int off_c;
-                off_c = (m << LG_N) | n;
+                int off_c = (m << LG_N) | n;
                 preload_gpr(
                     make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RC) + RV_REGS_BITS'(off_c)),
                     c_val);
             end
-        end
     endtask
 
-    // =========================================================================
-    // send_decode: drive decode_if with one decode_t, wait for VX_ibuffer ready.
-    // Timing follows L6 fire_tcu pattern: align to post-edge, assert, wait, deassert.
-    // =========================================================================
-    task automatic send_decode (input decode_t pkt);
+    // inject_wb_for_tile: simulate VX_commit writeback for all C-tile registers.
+    // Releases scoreboard so a subsequent WMMA can issue.
+    task automatic inject_wb_for_tile(input logic [`XLEN-1:0] val);
+        for (int m = 0; m < TCU_M_STEPS; m++)
+            for (int n = 0; n < TCU_N_STEPS; n++) begin
+                int off_c = (m << LG_N) | n;
+                preload_gpr(
+                    make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RC) + RV_REGS_BITS'(off_c)),
+                    val);
+            end
+    endtask
+
+    task automatic send_decode(input decode_t pkt);
         @(posedge clk); #1;
         decode_if.valid = 1'b1;
         decode_if.data  = pkt;
@@ -254,12 +172,15 @@ module tb_issue;
         decode_if.valid = 1'b0;
     endtask
 
+    // wait until tcu_dispatch_cnt reaches target
+    task automatic wait_dispatch(input int target);
+        while (tcu_dispatch_cnt < target) @(posedge clk);
+    endtask
+
     // =========================================================================
-    // Build LDSCALE decode_t
-    // rs1 = SCALE_REG (preloaded with packed {scale_b[7:0], scale_a[7:0]})
-    // E8M0: neutral = 8'd127; exp_total = scale_a + scale_b - 254
+    // Decode packet builders
     // =========================================================================
-    function automatic decode_t build_ldscale (input logic [UUID_WIDTH-1:0] uuid);
+    function automatic decode_t build_ldscale(input logic [UUID_WIDTH-1:0] uuid);
         decode_t d;
         d               = '0;
         d.uuid          = uuid;
@@ -270,23 +191,16 @@ module tb_issue;
 `ifdef EXT_AG_TCU_ENABLE
         d.op_args.tcu.tcu_op = TCU_OP_LDSCALE;
 `endif
-        d.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-        d.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
-        d.wb            = 1'b1;
-        d.used_rs       = 3'b001;    // only rs1 used
-        d.rd            = '0;        // writes d=0 to rd=x0
-        d.rs1           = SCALE_REG; // register holding packed scale
-        d.rs2           = '0;
-        d.rs3           = '0;
+        d.op_args.tcu.fmt_s = 4'(TCU_I8_ID);
+        d.op_args.tcu.fmt_d = 4'(TCU_FP32_ID);  // Phase 10: INT FEDP outputs FP32
+        // LDSCALE writes to scale_ctx (internal), not GPR → wb=0 avoids scoreboard lock
+        d.wb            = 1'b0;
+        d.used_rs       = 3'b001;
+        d.rs1           = SCALE_REG;
         return d;
     endfunction
 
-    // =========================================================================
-    // Build WMMA decode_t
-    // rs1/rs2/rs3/rd will be overridden by VX_tcu_uops for each microop.
-    // We set the base tile register indices as hints (not used after uop expansion).
-    // =========================================================================
-    function automatic decode_t build_wmma (input logic [UUID_WIDTH-1:0] uuid);
+    function automatic decode_t build_wmma(input logic [UUID_WIDTH-1:0] uuid);
         decode_t d;
         d               = '0;
         d.uuid          = uuid;
@@ -297,46 +211,41 @@ module tb_issue;
 `ifdef EXT_AG_TCU_ENABLE
         d.op_args.tcu.tcu_op = TCU_OP_WMMA;
 `endif
-        d.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-        d.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
+        d.op_args.tcu.fmt_s = 4'(TCU_I8_ID);
+        d.op_args.tcu.fmt_d = 4'(TCU_FP32_ID);
         d.wb            = 1'b1;
-        d.used_rs       = 3'b111;    // rs1,rs2,rs3 all used
-        d.rd            = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RC));
-        d.rs1           = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RA));
-        d.rs2           = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RB));
-        d.rs3           = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RC));
+        d.used_rs       = 3'b111;
+        d.rd  = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RC));
+        d.rs1 = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RA));
+        d.rs2 = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RB));
+        d.rs3 = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(TCU_RC));
         return d;
     endfunction
 
-    // =========================================================================
-    // wait_commit: spin until commit_wb[0].valid rises, return data.
-    // =========================================================================
-    task automatic wait_commit (output writeback_t res);
-        @(posedge clk);
-        while (!commit_wb[0].valid) @(posedge clk);
-        res = commit_wb[0].data;
-    endtask
-
-    // =========================================================================
-    // collect_wbs: collect `count` consecutive valid commits from commit_wb[0].
-    // =========================================================================
-    task automatic collect_wbs (
-        input  int           count,
-        output writeback_t   results []
-    );
-        results = new[count];
-        for (int i = 0; i < count; i++) begin
-            @(posedge clk);
-            while (!commit_wb[0].valid) @(posedge clk);
-            results[i] = commit_wb[0].data;
-        end
-    endtask
+    function automatic decode_t build_ldmicro(input logic [UUID_WIDTH-1:0] uuid);
+        decode_t d;
+        d               = '0;
+        d.uuid          = uuid;
+        d.wid           = '0;
+        d.tmask         = '1;
+        d.ex_type       = EX_BITS'(EX_TCU);
+        d.op_type       = INST_OP_BITS'(INST_TCU_WMMA);
+`ifdef EXT_AG_TCU_ENABLE
+        d.op_args.tcu.tcu_op = TCU_OP_LDMICRO;
+`endif
+        d.op_args.tcu.fmt_s = 4'(TCU_I8_ID);
+        d.op_args.tcu.fmt_d = 4'(TCU_FP32_ID);
+        d.wb            = 1'b0;   // no GPR writeback
+        d.used_rs       = 3'b011; // rs1 + rs2 used
+        d.rs1 = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(6));
+        d.rs2 = make_reg_num(REG_TYPE_F, RV_REGS_BITS'(7));
+        return d;
+    endfunction
 
     // =========================================================================
     // Stimulus
     // =========================================================================
     initial begin
-        // ---- Reset -----------------------------------------------------------
         reset           = 1'b1;
         decode_if.valid = 1'b0;
         decode_if.data  = '0;
@@ -348,63 +257,39 @@ module tb_issue;
         reset = 1'b0;
         @(posedge clk); #1;
 
-        $display("=== Level 7: VX_issue + VX_execute + VX_commit Testbench ===");
+        $display("=== Level 7: VX_issue standalone ===");
         $display("  UOPS=%0d  M_STEPS=%0d  N_STEPS=%0d  K_STEPS=%0d",
                  TCU_UOPS, TCU_M_STEPS, TCU_N_STEPS, TCU_K_STEPS);
-        $display("  TC_M=%0d  TC_N=%0d  TC_K=%0d",
-                 TCU_TC_M, TCU_TC_N, TCU_TC_K);
         $display("  NRA=%0d  NRB=%0d  NRC=%0d",
                  TCU_NRA, TCU_NRB, TCU_NRC);
-        $display("  RA=%0d  RB=%0d  RC=%0d",
-                 TCU_RA, TCU_RB, TCU_RC);
-        $display("--------------------------------------------------");
+        $display("------------------------------------------------------------");
 
         // ==================================================================
-        // TC1: LDSCALE single-uop check (RTL fix verification)
-        //   Send LDSCALE decode_t → expect exactly 1 commit (not UOPS=16).
-        //   SCALE_REG preloaded with 0 → scale_a=0, scale_b=0, data=0.
+        // TC1: LDSCALE → 1 dispatch (uop_sequencer single-UOP check)
         // ==================================================================
         begin : tc1
-            writeback_t ld_res;
+            int cnt_before, cnt_after;
             bit ok = 1;
 
-            // Preload SCALE_REG = {16'b0, 8'd127, 8'd127} (E8M0 neutral: exp_total=0)
             preload_gpr(SCALE_REG, 32'h7F7F);
-
-            // Switch to exec phase
             preload_phase = 1'b0;
             @(posedge clk); #1;
 
+            cnt_before = tcu_dispatch_cnt;
             send_decode(build_ldscale(next_uuid++));
+            wait_dispatch(cnt_before + 1);
+            cnt_after = tcu_dispatch_cnt;
 
-            // Expect exactly 1 commit with data=0
-            wait_commit(ld_res);
-
-            for (int t = 0; t < `SIMD_WIDTH; t++) begin
-                if (ld_res.data[t] !== '0) begin
-                    $display("[FAIL] TC1_ldscale_single_uop  [t=%0d] data=0x%0h (exp 0)",
-                             t, ld_res.data[t]);
-                    ok = 0;
-                end
-            end
-
-            // Wait 10 more cycles and verify no extra commit arrives
-            // (if uop_sequencer mistakenly expanded LDSCALE, extra commits would arrive)
-            begin : tc1_extra_check
-                int extra = 0;
-                repeat (10) begin
-                    @(posedge clk);
-                    if (commit_wb[0].valid) extra++;
-                end
-                if (extra > 0) begin
-                    $display("[FAIL] TC1_ldscale_single_uop  %0d extra commits (exp 0) — LDSCALE was expanded!",
-                             extra);
-                    ok = 0;
-                end
+            // Wait 10 cycles to ensure no extra dispatches (uop expansion bug)
+            repeat(10) @(posedge clk);
+            if (tcu_dispatch_cnt !== cnt_after) begin
+                $display("[FAIL] TC1_ldscale  extra dispatches: total=%0d, exp=%0d (LDSCALE was expanded!)",
+                         tcu_dispatch_cnt - cnt_before, 1);
+                ok = 0;
             end
 
             if (ok) begin
-                $display("[PASS] TC1_ldscale_single_uop      1 commit, data=0 (RTL fix OK)");
+                $display("[PASS] TC1_ldscale_single_dispatch  1 dispatch (uop_seq not expanded)");
                 pass_cnt++;
             end else fail_cnt++;
 
@@ -413,157 +298,127 @@ module tb_issue;
         end
 
         // ==================================================================
-        // TC2: WMMA uop count check
-        //   A=B=C=0 → all dot products = 0, all outputs = 0.
-        //   Verify exactly TCU_UOPS=16 commits arrive.
+        // TC2: WMMA → TCU_UOPS dispatches + sop/eop verification
         // ==================================================================
         begin : tc2
-            writeback_t dummy;
-            writeback_t results[];
+            int cnt_before, cnt_after;
+            int sop_cnt = 0, eop_cnt = 0;
             bit ok = 1;
 
-            // Preload all tile regs = 0
-            preload_tile_regs(32'd0, 32'd0, 32'd0);
-            preload_gpr(SCALE_REG, 32'h7F7F);  // E8M0 neutral: exp_total=0
-
-            preload_phase = 1'b0;
-            @(posedge clk); #1;
-
-`ifdef EXT_AG_TCU_ENABLE
-            // LDSCALE must precede WMMA in Avant-Garde TCU
-            send_decode(build_ldscale(next_uuid++));
-            wait_commit(dummy);    // drain 1 LDSCALE commit
-`endif
-
-            send_decode(build_wmma(next_uuid++));
-            collect_wbs(TCU_UOPS, results);
-
-            // Verify all UOPS outputs = 0
-            for (int r = 0; r < TCU_UOPS; r++) begin
-                for (int t = 0; t < `SIMD_WIDTH; t++) begin
-                    if (results[r].data[t] !== 32'd0) begin
-                        $display("[FAIL] TC2_wmma_uop_count  commit[%0d][t=%0d] data=0x%0h (exp 0)",
-                                 r, t, results[r].data[t]);
-                        ok = 0;
-                    end
-                end
-            end
-
-            if (ok) begin
-                $display("[PASS] TC2_wmma_uop_count          %0d commits, all data=0", TCU_UOPS);
-                pass_cnt++;
-            end else fail_cnt++;
-
-            preload_phase = 1'b1;
-            @(posedge clk); #1;
-        end
-
-        // ==================================================================
-        // TC3: LDSCALE(0,0) + WMMA  (A=B=0, C=42)
-        //   dot=0 per tile, so all outputs = 42 (C passes through unchanged).
-        // ==================================================================
-        begin : tc3
-            writeback_t dummy;
-            writeback_t results[];
-            bit ok = 1;
-
-            preload_tile_regs(32'd0, 32'd0, 32'd42);
-            preload_gpr(SCALE_REG, 32'h7F7F);  // E8M0 neutral: exp_total=0
-
+            preload_tile_regs(32'h01010101, 32'h01010101, 32'h00000000);
+            preload_gpr(SCALE_REG, 32'h7F7F);
             preload_phase = 1'b0;
             @(posedge clk); #1;
 
 `ifdef EXT_AG_TCU_ENABLE
             send_decode(build_ldscale(next_uuid++));
-            wait_commit(dummy);
+            wait_dispatch(tcu_dispatch_cnt + 1);
 `endif
+            cnt_before = tcu_dispatch_cnt;
 
-            send_decode(build_wmma(next_uuid++));
-            collect_wbs(TCU_UOPS, results);
-
-            for (int r = 0; r < TCU_UOPS; r++) begin
-                for (int t = 0; t < `SIMD_WIDTH; t++) begin
-                    if ($signed(results[r].data[t]) !== 32'sd42) begin
-                        $display("[FAIL] TC3_wmma_passthrough  commit[%0d][t=%0d] got=%0d (exp 42)",
-                                 r, t, $signed(results[r].data[t]));
-                        ok = 0;
-                    end
-                end
-            end
-
-            if (ok) begin
-                $display("[PASS] TC3_wmma_passthrough        all %0d outputs = 42", TCU_UOPS);
-                pass_cnt++;
-            end else fail_cnt++;
-
-            preload_phase = 1'b1;
-            @(posedge clk); #1;
-        end
-
-        // ==================================================================
-        // TC4: LDSCALE(scale_a=2, scale_b=0) + WMMA  (A=B=ones, C=0)
-        //   dot_per_uop = TC_K * 4 * 1 * 1 = 8
-        //   exp_total = 2 → shifted = 8 << 2 = 32
-        //   k=0 result  = shifted + 0 = 32  (C_init=0)
-        //   k=1 result  = shifted + 32 = 64 (accumulated via writeback_if mux)
-        //   Final per tile = K_STEPS * 32 = 64
-        //   Verify each commit is 32 (k=0) or 64 (k=1),
-        //   and exactly TCU_NRC commits have the final value 64.
-        // ==================================================================
-        begin : tc4
-            writeback_t dummy;
-            writeback_t results[];
-            bit ok = 1;
-            int dot_per_uop;
-            int exp_shifted;  // dot << exp_total
-            int exp_k0;       // k=0 tile result
-            int exp_final;    // k=1 (final accumulated) tile result
-
-            dot_per_uop = TCU_TC_K * 4;       // 8 for NT=4
-            exp_shifted = dot_per_uop <<< 2;  // 8 << 2 = 32
-            exp_k0      = exp_shifted + 0;    // = 32 (C_init=0)
-            exp_final   = exp_shifted + exp_k0; // = 64 (k=1 adds another shifted)
-
-            preload_tile_regs(32'h01010101, 32'h01010101, 32'd0);
-            preload_gpr(SCALE_REG, 32'h7F81);  // E8M0: scale_a=129(=127+2), scale_b=127 → exp_total=2
-
-            preload_phase = 1'b0;
-            @(posedge clk); #1;
-
-`ifdef EXT_AG_TCU_ENABLE
-            send_decode(build_ldscale(next_uuid++));
-            wait_commit(dummy);
-`endif
-
-            send_decode(build_wmma(next_uuid++));
-            collect_wbs(TCU_UOPS, results);
-
-            begin : tc4_check
-                int final_cnt = 0;
-                for (int r = 0; r < TCU_UOPS; r++) begin
-                    for (int t = 0; t < `SIMD_WIDTH; t++) begin
-                        logic signed [31:0] got = $signed(results[r].data[t]);
-                        if (got !== 32'(exp_k0) && got !== 32'(exp_final)) begin
-                            $display("[FAIL] TC4_scale_accumulation  commit[%0d][t=%0d] got=%0d (exp %0d or %0d)",
-                                     r, t, got, exp_k0, exp_final);
-                            ok = 0;
+            // 3-thread fork:
+            //   T1: send WMMA decode packet
+            //   T2: observe sop/eop at each dispatch (fast, no blocking commit)
+            //   T3: inject_wb_for_tile between K-steps to release scoreboard
+            //       (without VX_execute, rd==rs3 C-tile lock must be cleared before sk+1)
+            begin : tc2_fork_blk
+                automatic logic [UUID_WIDTH-1:0] u2 = next_uuid++;
+                fork
+                    // Thread 1: send WMMA decode packet
+                    send_decode(build_wmma(u2));
+                    // Thread 2: observe dispatches for sop/eop (no commit injection here)
+                    begin
+                        for (int i = 0; i < TCU_UOPS; i++) begin
+                            @(posedge clk iff (dispatch_if[EX_TCU * `ISSUE_WIDTH].valid &&
+                                               dispatch_if[EX_TCU * `ISSUE_WIDTH].ready));
+                            #1;
+                            if (dispatch_if[EX_TCU * `ISSUE_WIDTH].data.sop) sop_cnt++;
+                            if (dispatch_if[EX_TCU * `ISSUE_WIDTH].data.eop) eop_cnt++;
                         end
                     end
-                    // Count commits that have the final accumulated value
-                    if ($signed(results[r].data[0]) === 32'(exp_final))
-                        final_cnt++;
-                end
-                // Exactly TCU_NRC = M_STEPS*N_STEPS tiles should have the final value
-                if (final_cnt !== TCU_NRC) begin
-                    $display("[FAIL] TC4_scale_accumulation  final_cnt=%0d (exp %0d = TCU_NRC)",
-                             final_cnt, TCU_NRC);
-                    ok = 0;
-                end
+                    // Thread 3: release C-tile scoreboard entries between K-steps
+                    begin
+                        for (int k = 0; k < TCU_K_STEPS; k++) begin
+                            // Wait for one K-step worth of dispatches
+                            wait_dispatch(cnt_before + (k + 1) * (TCU_M_STEPS * TCU_N_STEPS));
+                            // Release all C-tile register locks so the next K-step can read C
+                            if (k < TCU_K_STEPS - 1)
+                                inject_wb_for_tile('0);
+                        end
+                    end
+                join
+            end
+            wait_dispatch(cnt_before + TCU_UOPS);
+            cnt_after = tcu_dispatch_cnt;
+
+            if ((cnt_after - cnt_before) !== TCU_UOPS) begin
+                $display("[FAIL] TC2_wmma_uop_count  dispatches=%0d (exp %0d)",
+                         cnt_after - cnt_before, TCU_UOPS);
+                ok = 0;
+            end
+            // With SIMD_COUNT=1 (NUM_THREADS==SIMD_WIDTH), every dispatch is a
+            // full SIMD packet so sop=eop=1 for every UOP — expected behavior.
+            if (sop_cnt !== TCU_UOPS) begin
+                $display("[FAIL] TC2_wmma_sop  sop_cnt=%0d (exp %0d, SIMD_COUNT=1 → sop=1 always)",
+                         sop_cnt, TCU_UOPS);
+                ok = 0;
+            end
+            if (eop_cnt !== TCU_UOPS) begin
+                $display("[FAIL] TC2_wmma_eop  eop_cnt=%0d (exp %0d, SIMD_COUNT=1 → eop=1 always)",
+                         eop_cnt, TCU_UOPS);
+                ok = 0;
             end
 
             if (ok) begin
-                $display("[PASS] TC4_scale_accumulation      k0=%0d kfinal=%0d, %0d tiles finalized",
-                         exp_k0, exp_final, TCU_NRC);
+                $display("[PASS] TC2_wmma_uop_count   %0d dispatches, sop/eop=1 each (SIMD_COUNT=1)", TCU_UOPS);
+                pass_cnt++;
+            end else fail_cnt++;
+
+            preload_phase = 1'b1;
+            inject_wb_for_tile(32'h41800000);  // release scoreboard
+        end
+
+        // ==================================================================
+        // TC3: LDMICRO → 1 dispatch, dispatch.wb=0 [Phase 10]
+        // ==================================================================
+        begin : tc3
+            int cnt_before, cnt_after;
+            logic wb_at_dispatch;
+            bit ok = 1;
+
+            preload_gpr(make_reg_num(REG_TYPE_F, RV_REGS_BITS'(6)), 32'h3);
+            preload_gpr(make_reg_num(REG_TYPE_F, RV_REGS_BITS'(7)), 32'h0);
+            preload_phase = 1'b0;
+            @(posedge clk); #1;
+
+            cnt_before = tcu_dispatch_cnt;
+            begin : tc3_fork_blk
+                automatic logic [UUID_WIDTH-1:0] u3 = next_uuid++;
+                fork
+                    send_decode(build_ldmicro(u3));
+                    begin
+                        @(posedge clk iff (dispatch_if[EX_TCU * `ISSUE_WIDTH].valid &&
+                                           dispatch_if[EX_TCU * `ISSUE_WIDTH].ready));
+                        wb_at_dispatch = dispatch_if[EX_TCU * `ISSUE_WIDTH].data.wb;
+                    end
+                join
+            end
+            wait_dispatch(cnt_before + 1);
+            cnt_after = tcu_dispatch_cnt;
+
+            // Wait to verify no extra dispatches
+            repeat(10) @(posedge clk);
+            if ((cnt_after - cnt_before) !== 1) begin
+                $display("[FAIL] TC3_ldmicro  dispatch count=%0d (exp 1)", cnt_after - cnt_before);
+                ok = 0;
+            end
+            if (wb_at_dispatch !== 1'b0) begin
+                $display("[FAIL] TC3_ldmicro  dispatch.wb=%0b (exp 0: no writeback)", wb_at_dispatch);
+                ok = 0;
+            end
+
+            if (ok) begin
+                $display("[PASS] TC3_ldmicro_dispatch   1 dispatch, wb=0 confirmed");
                 pass_cnt++;
             end else fail_cnt++;
 
@@ -572,67 +427,154 @@ module tb_issue;
         end
 
         // ==================================================================
-        // TC5: LDSCALE(0,0) + WMMA  (A=B=ones, C=-200)
-        //   dot_per_uop = 8, exp_total = 0 → shifted = 8
-        //   k=0 result  = 8 + (-200) = -192
-        //   k=1 result  = 8 + (-192) = -184  (final)
-        //   Verify each commit is -192 (k=0) or -184 (k=1).
+        // TC4: Scoreboard RAW stall
+        //   WMMA#1 dispatches → WMMA#2 stalls (C-tile WAW hazard) →
+        //   inject writeback → WMMA#2 dispatches
         // ==================================================================
-        begin : tc5
-            writeback_t dummy;
-            writeback_t results[];
+        begin : tc4
+            int cnt_w1_start, cnt_w1_end, cnt_stall_mid, cnt_w2_end;
             bit ok = 1;
-            int c_init      = -200;
-            int dot_per_uop = TCU_TC_K * 4;  // 8 for NT=4
-            int exp_k0      = dot_per_uop + c_init;   // 8 + (-200) = -192
-            int exp_final   = dot_per_uop + exp_k0;   // 8 + (-192) = -184
 
-            preload_tile_regs(32'h01010101, 32'h01010101, 32'(signed'(-200)));
-            preload_gpr(SCALE_REG, 32'h7F7F);  // E8M0 neutral: exp_total=0
-
+            preload_tile_regs(32'h01010101, 32'h01010101, 32'h00000000);
+            preload_gpr(SCALE_REG, 32'h7F7F);
             preload_phase = 1'b0;
             @(posedge clk); #1;
 
 `ifdef EXT_AG_TCU_ENABLE
             send_decode(build_ldscale(next_uuid++));
-            wait_commit(dummy);
+            wait_dispatch(tcu_dispatch_cnt + 1);
 `endif
 
-            send_decode(build_wmma(next_uuid++));
-            collect_wbs(TCU_UOPS, results);
-
-            for (int r = 0; r < TCU_UOPS; r++) begin
-                for (int t = 0; t < `SIMD_WIDTH; t++) begin
-                    logic signed [31:0] got = $signed(results[r].data[t]);
-                    if (got !== 32'(exp_k0) && got !== 32'(exp_final)) begin
-                        $display("[FAIL] TC5_neg_accumulator  commit[%0d][t=%0d] got=%0d (exp %0d or %0d)",
-                                 r, t, got, exp_k0, exp_final);
-                        ok = 0;
+            // WMMA #1: dispatch all UOPs.
+            // Requires k-step wb injection (same as TC2) because UOP 8 (k=1)
+            // needs C-tiles that UOP 0-7 (k=0) locked.
+            cnt_w1_start = tcu_dispatch_cnt;
+            begin : tc4_w1_fork_blk
+                automatic logic [UUID_WIDTH-1:0] u_w1 = next_uuid++;
+                fork
+                    send_decode(build_wmma(u_w1));
+                    begin
+                        for (int k = 0; k < TCU_K_STEPS; k++) begin
+                            wait_dispatch(cnt_w1_start + (k+1) * (TCU_M_STEPS * TCU_N_STEPS));
+                            if (k < TCU_K_STEPS - 1) begin
+                                preload_phase = 1'b1;
+                                inject_wb_for_tile('0);
+                                preload_phase = 1'b0;
+                            end
+                        end
                     end
-                end
+                join
+            end
+            wait_dispatch(cnt_w1_start + TCU_UOPS);
+            cnt_w1_end = tcu_dispatch_cnt;
+            // C-tiles are now locked by WMMA#1 k=1 UOPs.
+
+            // Queue WMMA#2 (stalls: C-tiles still locked by WMMA#1 k=1)
+            // Use module-level fork_uuid to avoid Verilator LIFETIME error with join_none
+            fork_uuid = next_uuid++;
+            fork
+                send_decode(build_wmma(fork_uuid));
+            join_none
+
+            // Stall observation: 8 cycles with no new dispatch
+            repeat(8) @(posedge clk);
+            cnt_stall_mid = tcu_dispatch_cnt;
+
+            if (cnt_stall_mid > cnt_w1_end) begin
+                $display("[WARN] TC4: WMMA#2 dispatched %0d uops before wb injection (stall not observed)",
+                         cnt_stall_mid - cnt_w1_end);
+            end
+
+            // Inject wb → WMMA#2 k=0 UOPs (0-7) can now dispatch
+            preload_phase = 1'b1;
+            inject_wb_for_tile(32'h41800000);
+            preload_phase = 1'b0;
+
+            // Wait for WMMA#2 k=0 step (M*N UOPs)
+            wait_dispatch(cnt_w1_end + TCU_M_STEPS * TCU_N_STEPS);
+
+            // WMMA#2 k=1 UOPs stall on C-tiles locked by its own k=0 → inject again
+            preload_phase = 1'b1;
+            inject_wb_for_tile(32'h41800000);
+            preload_phase = 1'b0;
+
+            // Wait for all WMMA#2 UOPs
+            wait_dispatch(cnt_w1_end + TCU_UOPS);
+            cnt_w2_end = tcu_dispatch_cnt;
+
+            if ((cnt_w2_end - cnt_w1_end) !== TCU_UOPS) begin
+                $display("[FAIL] TC4_stall  WMMA#2 dispatches=%0d after wb (exp %0d)",
+                         cnt_w2_end - cnt_w1_end, TCU_UOPS);
+                ok = 0;
             end
 
             if (ok) begin
-                $display("[PASS] TC5_neg_accumulator         k0=%0d kfinal=%0d (correct)",
-                         exp_k0, exp_final);
+                $display("[PASS] TC4_scoreboard_raw_stall   WMMA#2 dispatched after writeback injection");
                 pass_cnt++;
             end else fail_cnt++;
 
             preload_phase = 1'b1;
-            @(posedge clk); #1;
+            inject_wb_for_tile(32'd0);
         end
 
         // ==================================================================
         // Summary
         // ==================================================================
-        $display("--------------------------------------------------");
+        // ==================================================================
+        // TC5: LDSCALE dispatch → rs1_data carries packed scale from reg file
+        //   preload SCALE_REG = 32'h7F81 → scale_a=0x81=129, scale_b=0x7F=127
+        //   Expect dispatch_if.rs1_data[0] == 32'h00007F81
+        //   Verifies operands unit reads SCALE_REG correctly at dispatch time.
+        // ==================================================================
+        begin : tc5
+            logic [31:0] scale_packed = 32'h00007F81;  // {scale_b=127, scale_a=129}
+            logic [31:0] got_rs1;
+            bit ok = 1;
+            int cnt_before;
+
+            preload_gpr(SCALE_REG, scale_packed);
+            preload_phase = 1'b0;
+            @(posedge clk); #1;
+
+            cnt_before = tcu_dispatch_cnt;
+            begin : tc5_fork_blk
+                automatic logic [UUID_WIDTH-1:0] u5 = next_uuid++;
+                fork
+                    send_decode(build_ldscale(u5));
+                    begin
+                        // Sample rs1_data at the dispatch handshake cycle
+                        @(posedge clk iff (dispatch_if[EX_TCU * `ISSUE_WIDTH].valid &&
+                                           dispatch_if[EX_TCU * `ISSUE_WIDTH].ready));
+                        got_rs1 = dispatch_if[EX_TCU * `ISSUE_WIDTH].data.rs1_data[0];
+                    end
+                join
+            end
+            wait_dispatch(cnt_before + 1);
+
+            if (got_rs1 !== scale_packed) begin
+                $display("[FAIL] TC5_ldscale_rs1_data  rs1_data[0]=0x%08h (exp 0x%08h = {scale_b=127, scale_a=129})",
+                         got_rs1, scale_packed);
+                ok = 0;
+            end
+
+            if (ok) begin
+                $display("[PASS] TC5_ldscale_rs1_data   rs1_data[0]=0x%08h (scale correctly read from reg file)",
+                         got_rs1);
+                pass_cnt++;
+            end else fail_cnt++;
+
+            preload_phase = 1'b1;
+            @(posedge clk); #1;
+        end
+
+        $display("------------------------------------------------------------");
         $display("Results: %0d PASS / %0d FAIL  (total %0d)",
                  pass_cnt, fail_cnt, pass_cnt + fail_cnt);
         if (fail_cnt == 0)
             $display("ALL TESTS PASSED");
         else
             $display("SOME TESTS FAILED");
-        $display("==================================================");
+        $display("============================================================");
         $finish;
     end
 

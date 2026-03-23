@@ -22,8 +22,8 @@
 //     for VX_tcu_operand_transformer wmma_inflight tracking
 //
 // PIPE_LATENCY (internal, for mdata_queue depth):
-//   FEDP_LATENCY(4) + mdata(1) = 5 (unchanged from Phase 6).
-//   Total pipeline including OT = 6 (tracked in VX_tcu_unit).
+//   FEDP_LATENCY(5) + mdata(1) = 6 (Phase 10: SCALE+FADD stages added).
+//   Total pipeline including OT = 7 (tracked in VX_tcu_unit).
 
 `include "VX_define.vh"
 
@@ -53,11 +53,13 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     `UNUSED_SPARAM (INSTANCE_ID);
 
     localparam MDATA_WIDTH  = UUID_WIDTH + NW_WIDTH + PC_BITS + NUM_REGS_BITS + 1;  // +1 for wb
-    localparam MUL_LATENCY  = 2;
-    localparam ADD_LATENCY  = 1;
-    localparam ACC_LATENCY  = $clog2(TCU_TC_K) * ADD_LATENCY + ADD_LATENCY;
-    localparam FEDP_LATENCY = MUL_LATENCY + ACC_LATENCY;
-    localparam PIPE_LATENCY = FEDP_LATENCY + 1;         // Internal: 5 cycles
+    localparam MUL_LATENCY   = 2;
+    localparam ADD_LATENCY   = 1;
+    localparam RED_LATENCY   = $clog2(TCU_TC_K) * ADD_LATENCY;
+    localparam SCALE_LATENCY = 1;
+    localparam FADD_LATENCY  = 1;
+    localparam FEDP_LATENCY  = MUL_LATENCY + RED_LATENCY + SCALE_LATENCY + FADD_LATENCY;
+    localparam PIPE_LATENCY  = FEDP_LATENCY + 1;        // Internal: 6 cycles
     localparam MDATA_QUEUE_DEPTH = 1 << $clog2(PIPE_LATENCY);
 
     localparam LG_A_BS = $clog2(TCU_A_BLOCK_SIZE);

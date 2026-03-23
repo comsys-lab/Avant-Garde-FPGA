@@ -14,8 +14,9 @@
 `include "VX_define.vh"
 
 module VX_tcu_fedp_bhf #(
-    parameter LATENCY = 1,
-    parameter N = 1
+    parameter LATENCY      = 1,
+    parameter N            = 1,
+    parameter EXP_TOTAL_W  = 10  // signed global exponent width (TCU_EXP_TOTAL)
 ) (
     input  wire clk,
     input  wire reset,
@@ -23,6 +24,8 @@ module VX_tcu_fedp_bhf #(
 
     input  wire[2:0] fmt_s,
     input  wire[2:0] fmt_d,
+
+    input  wire signed [EXP_TOTAL_W-1:0] exp_total,  // global exponent (scale_a+scale_b-254)
 
     input  wire [N-1:0][`XLEN-1:0] a_row,
     input  wire [N-1:0][`XLEN-1:0] b_col,
@@ -41,7 +44,7 @@ module VX_tcu_fedp_bhf #(
     localparam FMT_DELAY = FMUL_LATENCY + FRND_LATENCY;
     localparam C_DELAY = (FMUL_LATENCY + FRND_LATENCY) + 1 + FRED_LATENCY;
 
-    `UNUSED_VAR ({fmt_d, c_val});
+    `UNUSED_VAR (fmt_d);
 
     wire [2:0] frm = '0; // RNE rounding mode
 
@@ -195,6 +198,54 @@ module VX_tcu_fedp_bhf #(
         .data_out(c_delayed)
     );
 
+    // -------------------------------------------------------------------------
+    // Post-multiply global exponent shift (Avant-Garde paper):
+    //   D = (sum(A_i * B_i) * 2^exp_total) + C
+    //   Applied after reduction tree, before final C accumulation.
+    //   exp_total delayed by C_DELAY to align with red_in[LEVELS][0].
+    // -------------------------------------------------------------------------
+
+    // Delay exp_total same depth as c_val (C_DELAY cycles)
+    wire signed [EXP_TOTAL_W-1:0] exp_total_d;
+    VX_pipe_register #(
+        .DATAW (EXP_TOTAL_W),
+        .DEPTH (C_DELAY)
+    ) pipe_exp_total (
+        .clk     (clk),
+        .reset   (reset),
+        .enable  (enable),
+        .data_in (exp_total),
+        .data_out(exp_total_d)
+    );
+
+    // Convert reduction result from HardFloat recoded → IEEE FP32
+    wire [31:0] red_sum_ieee;
+    recFNToFN #(.expWidth(8), .sigWidth(24)) conv_red_to_ieee (
+        .in  (red_in[LEVELS][0]),
+        .out (red_sum_ieee)
+    );
+
+    // Adjust IEEE FP32 exponent by exp_total_d (saturating)
+    wire signed [9:0] new_exp_w =
+          $signed({2'b0, red_sum_ieee[30:23]})
+        + $signed({{(10-EXP_TOTAL_W){exp_total_d[EXP_TOTAL_W-1]}}, exp_total_d});
+
+    logic [31:0] red_sum_scaled;
+    always_comb begin
+        if      (red_sum_ieee[30:23] == 8'h00)      red_sum_scaled = red_sum_ieee;                      // ±0 / denorm
+        else if (red_sum_ieee[30:23] == 8'hFF)      red_sum_scaled = red_sum_ieee;                      // ±Inf / NaN
+        else if (new_exp_w >= $signed(10'd255))     red_sum_scaled = {red_sum_ieee[31], 8'hFF, 23'h0};  // overflow → ±Inf
+        else if (new_exp_w <= $signed(10'd0))       red_sum_scaled = {red_sum_ieee[31], 31'h0};         // underflow → ±0
+        else                                        red_sum_scaled = {red_sum_ieee[31], new_exp_w[7:0], red_sum_ieee[22:0]};
+    end
+
+    // Convert scaled result back to HardFloat recoded for final_add
+    wire [32:0] red_sum_scaled_rec;
+    fNToRecFN #(.expWidth(8), .sigWidth(24)) conv_scaled_to_rec (
+        .in  (red_sum_scaled),
+        .out (red_sum_scaled_rec)
+    );
+
     // Final accumulation
     VX_tcu_bhf_fadd #(
         .IN_EXPW (8),
@@ -208,7 +259,7 @@ module VX_tcu_fedp_bhf #(
         .reset  (reset),
         .enable (enable),
         .frm    (frm),
-        .a      (red_in[LEVELS][0]),
+        .a      (red_sum_scaled_rec),
         .b      (c_delayed),
         .y      (result),
         `UNUSED_PIN(fflags)

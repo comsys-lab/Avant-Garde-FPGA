@@ -11,21 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// AG-TCU: Fused Element Dot Product (Integer) with Partial Sum Alignment
+// AG-TCU: Fused Element Dot Product (Integer) with Scaling Unit FP32 Output
 //
-// Implements the Avant-Garde Scaled Numeric Format semantics:
-//   D = (A x B) <<± exp_total + C
-// where exp_total = scale_a + scale_b - 2*bias (Phase 5: E8M0, signed 10-bit, range [-254,+256]).
-// exp_total >= 0: left shift (scale up). exp_total < 0: arithmetic right shift (scale down).
-// Effective range clamped to [-31, +30] (AG_TCU_EXP_MIN / AG_TCU_EXP_MAX).
+// Phase 10 redesign:
+//   D = float(dot(A,B)) * 2^exp_total + C
+//   where:
+//     dot(A,B) = INT8×INT8 MAC (after OT flatten)
+//     exp_total = scale_a + scale_b - 2*bias (E8M0, signed 10-bit)
+//     C = FP32 accumulator (rs3_data, zero-initialized for first k-step)
+//     D = FP32 output
 //
-// Design principles:
-//   - INT8 x INT8 MAC array (g_prod): UNCHANGED from VX_tcu_fedp_int
-//   - Reduction tree (g_red_tree):    UNCHANGED from VX_tcu_fedp_int
-//   - Partial Sum Alignment stage:    NEW - combinational shift before acc
-//   - exp_total pipelined as metadata alongside partial sum (no critical-path impact)
-//   - Saturation policy: signed INT32 saturate on overflow from alignment shift
-//   - Pipeline depth (FEDP_LATENCY):  UNCHANGED from VX_tcu_fedp_int
+// Pipeline stages:
+//   [MUL, 2cy] INT8×INT8 MAC → PSEL
+//   [RED, 1cy] Reduction tree → INT partial sum (REDW bits)
+//   [SCALE,1cy] INT32→FP32 (CLZ-based) + exp_total exponent adjust → FP32
+//   [FADD, 1cy] FP32_scaled + C(FP32) → FP32
+//
+// Total LATENCY = MUL(2) + RED($clog2(N)) + SCALE(1) + FADD(1)
+//              = 5 cycles for N=2 (NT=4 / NT=8 with TCU_TC_K=2)
 
 `include "VX_define.vh"
 
@@ -42,34 +45,29 @@ module VX_tcu_fedp_int_scaled #(
     input  wire [2:0] fmt_d,
 
     // AG-TCU: signed tile-level exponent = scale_a + scale_b - 2*bias.
-    // Phase 5: E8M0 — signed 10-bit (EXP_TOTAL), range [-254, +256], clamped to [-31, +30].
     input  wire signed [EXP_TOTAL-1:0] exp_total,
 
     input  wire [N-1:0][`XLEN-1:0] a_row,
     input  wire [N-1:0][`XLEN-1:0] b_col,
-    input  wire [`XLEN-1:0]        c_val,
-    output wire [`XLEN-1:0]        d_val
+    input  wire [`XLEN-1:0]        c_val,   // FP32 accumulator (IEEE 754)
+    output wire [`XLEN-1:0]        d_val    // FP32 result (IEEE 754)
 );
     // ---------------------------------------------------------------------------
-    // Latency constants (must match VX_tcu_int.sv FEDP_LATENCY)
+    // Latency constants
     // ---------------------------------------------------------------------------
-    localparam LEVELS      = $clog2(N);
-    localparam PRODW       = 18;
-    localparam PSELW       = PRODW + 1;            // unsigned guard bit
-    localparam REDW        = `MAX(PRODW + LEVELS, PSELW);
-    localparam MUL_LATENCY = 2;
-    localparam ADD_LATENCY = 1;
-    localparam RED_LATENCY = LEVELS * ADD_LATENCY;
-    localparam ACC_LATENCY = RED_LATENCY + ADD_LATENCY;
+    localparam LEVELS        = $clog2(N);
+    localparam PRODW         = 18;
+    localparam PSELW         = PRODW + 1;            // unsigned guard bit
+    localparam REDW          = `MAX(PRODW + LEVELS, PSELW);
+    localparam MUL_LATENCY   = 2;
+    localparam ADD_LATENCY   = 1;
+    localparam RED_LATENCY   = LEVELS * ADD_LATENCY;
+    localparam SCALE_LATENCY = 1;
+    localparam FADD_LATENCY  = 1;
+    localparam TOTAL_LATENCY = MUL_LATENCY + RED_LATENCY + SCALE_LATENCY + FADD_LATENCY;
 
-    // Alignment result width: REDW bits shifted left by up to 30 positions.
-    // 30 = AG_TCU_EXP_MAX clamp (effective left-shift ceiling).
-    // Right shifts reduce magnitude and never exceed REDW bits.
-    localparam ALIGNED_W   = REDW + 30;
+    `STATIC_ASSERT (LATENCY == TOTAL_LATENCY, ("invalid LATENCY parameter!"));
 
-    `STATIC_ASSERT (LATENCY == (MUL_LATENCY + ACC_LATENCY), ("invalid LATENCY parameter!"));
-
-    `UNUSED_VAR ({a_row, b_col, c_val});
     `UNUSED_VAR (fmt_d);
 
     // ---------------------------------------------------------------------------
@@ -88,9 +86,9 @@ module VX_tcu_fedp_int_scaled #(
     );
 
     // ---------------------------------------------------------------------------
-    // [Stage 0] exp_total pipeline: synchronise with partial sum at LEVELS output
+    // [Stage 0] exp_total pipeline: synchronise with partial sum at RED output
     // Depth = MUL_LATENCY + RED_LATENCY so that delayed_exp arrives at the same
-    // cycle as red_in[LEVELS][0].
+    // cycle as red_in[LEVELS][0] (SCALE stage input).
     // ---------------------------------------------------------------------------
     wire signed [EXP_TOTAL-1:0] delayed_exp;
     VX_pipe_register #(
@@ -105,7 +103,23 @@ module VX_tcu_fedp_int_scaled #(
     );
 
     // ---------------------------------------------------------------------------
-    // [Stage 1-2] Multiply stage — INT8 x INT8, UNCHANGED from VX_tcu_fedp_int
+    // [Stage 0] c_val pipeline: align with FADD stage input
+    // Depth = MUL_LATENCY + RED_LATENCY + SCALE_LATENCY
+    // ---------------------------------------------------------------------------
+    wire [31:0] delayed_c;
+    VX_pipe_register #(
+        .DATAW (32),
+        .DEPTH (MUL_LATENCY + RED_LATENCY + SCALE_LATENCY)
+    ) pipe_c (
+        .clk      (clk),
+        .reset    (reset),
+        .enable   (enable),
+        .data_in  (c_val[31:0]),
+        .data_out (delayed_c)
+    );
+
+    // ---------------------------------------------------------------------------
+    // [Stage 1-2] Multiply stage — INT8 x INT8, unchanged from VX_tcu_fedp_int
     // ---------------------------------------------------------------------------
     wire [PSELW-1:0] mult_result [N];
 
@@ -188,7 +202,7 @@ module VX_tcu_fedp_int_scaled #(
     end
 
     // ---------------------------------------------------------------------------
-    // [Stage 3-...] Reduction tree — UNCHANGED from VX_tcu_fedp_int
+    // [Stage 3-...] Reduction tree — unchanged from VX_tcu_fedp_int
     // ---------------------------------------------------------------------------
     wire [REDW-1:0] red_in [LEVELS+1][N];
 
@@ -215,77 +229,171 @@ module VX_tcu_fedp_int_scaled #(
     end
 
     // ---------------------------------------------------------------------------
-    // c_val delay pipeline — same depth as VX_tcu_fedp_int
+    // Helper: INT32 → IEEE FP32 (exact for |v| <= 2^23, no rounding needed)
+    //
+    // Algorithm:
+    //   1. sign = v[31]
+    //   2. abs_v = |v| (32-bit 2's complement)
+    //   3. Find MSB position via priority encoder (lz = 31 - MSB_pos)
+    //   4. biased_exp = (31 - lz) + 127
+    //   5. norm = abs_v << lz  (MSB at bit31 = implicit leading 1)
+    //   6. mantissa = norm[30:8]  (23 fractional bits)
     // ---------------------------------------------------------------------------
-    wire [31:0] delayed_c;
+    function automatic logic [31:0] int32_to_fp32(input logic signed [31:0] v);
+        logic        sign;
+        logic [31:0] abs_v;
+        logic [4:0]  lz;    // leading zeros = 31 - MSB_pos
+        logic [7:0]  exp_r;
+        logic [31:0] norm;
+
+        if (v == 32'sh0) return 32'h0000_0000;
+
+        sign  = v[31];
+        abs_v = sign ? 32'($unsigned(-v)) : 32'($unsigned(v));
+
+        // Priority encoder: last assignment wins → lz = 31 - highest_set_bit
+        lz = 5'd31;
+        for (int k = 0; k <= 31; k++) begin
+            if (abs_v[k]) lz = 5'd31 - 5'(k);
+        end
+
+        exp_r = 8'd31 - 8'(lz) + 8'd127;
+        norm  = abs_v << lz;          // MSB at bit31, bits[30:8] = mantissa
+
+        return {sign, exp_r, norm[30:8]};
+    endfunction
+
+    // ---------------------------------------------------------------------------
+    // Helper: Adjust IEEE FP32 exponent by signed exp_total (saturating)
+    //   Result = fp32_in * 2^exp_delta
+    // ---------------------------------------------------------------------------
+    function automatic logic [31:0] fp32_exp_scale(
+        input logic [31:0]                     fp32_in,
+        input logic signed [EXP_TOTAL-1:0]    exp_delta
+    );
+        logic [7:0]  old_exp;
+        logic signed [9:0] new_exp;
+
+        if (fp32_in[30:23] == 8'h00) return fp32_in;  // ±0 → no-op
+        if (fp32_in[30:23] == 8'hFF) return fp32_in;  // Inf/NaN → passthrough
+
+        old_exp = fp32_in[30:23];
+        new_exp = $signed({2'b0, old_exp})
+                + $signed({{(10-EXP_TOTAL){exp_delta[EXP_TOTAL-1]}}, exp_delta});
+
+        if (new_exp >= $signed(10'd255)) return {fp32_in[31], 8'hFF, 23'h0};  // overflow → ±Inf
+        if (new_exp <= $signed(10'd0))   return {fp32_in[31], 31'h0};          // underflow → ±0
+
+        return {fp32_in[31], new_exp[7:0], fp32_in[22:0]};
+    endfunction
+
+    // ---------------------------------------------------------------------------
+    // Helper: IEEE 754 FP32 addition (handles normal numbers and zero)
+    //   Round-to-nearest (no sticky bits, simplified for integer-origin values)
+    // ---------------------------------------------------------------------------
+    function automatic logic [31:0] fp32_add(
+        input logic [31:0] a,
+        input logic [31:0] b
+    );
+        logic sign_a, sign_b, sign_r;
+        logic [7:0]  exp_a, exp_b, exp_big, exp_r;
+        logic [23:0] sig_a, sig_b, sig_big, sig_sml;
+        logic [7:0]  exp_diff;
+        logic [24:0] sig_sum;
+        logic [4:0]  norm_shift;
+        logic [23:0] sig_norm;
+
+        sign_a = a[31]; exp_a = a[30:23];
+        sign_b = b[31]; exp_b = b[30:23];
+
+        // Handle zero (subnormals treated as zero)
+        if (exp_a == 8'h00) return b;
+        if (exp_b == 8'h00) return a;
+        // Handle Inf/NaN
+        if (exp_a == 8'hFF) return a;
+        if (exp_b == 8'hFF) return b;
+
+        sig_a = {1'b1, a[22:0]};
+        sig_b = {1'b1, b[22:0]};
+
+        // Choose larger-magnitude operand as base (by exponent, then mantissa)
+        if (exp_a > exp_b || (exp_a == exp_b && a[22:0] >= b[22:0])) begin
+            exp_big  = exp_a;
+            exp_diff = 8'(exp_a - exp_b);
+            sig_big  = sig_a;
+            sig_sml  = (exp_diff >= 8'd24) ? 24'h0 : (sig_b >> exp_diff);
+            sign_r   = sign_a;
+        end else begin
+            exp_big  = exp_b;
+            exp_diff = 8'(exp_b - exp_a);
+            sig_big  = sig_b;
+            sig_sml  = (exp_diff >= 8'd24) ? 24'h0 : (sig_a >> exp_diff);
+            sign_r   = sign_b;
+        end
+
+        if (sign_a == sign_b) begin
+            // Same sign: add significands
+            sig_sum = {1'b0, sig_big} + {1'b0, sig_sml};
+            if (sig_sum[24]) begin
+                // Carry out → exponent +1, shift mantissa right
+                exp_r = exp_big + 8'd1;
+                if (exp_r == 8'hFF) return {sign_r, 8'hFF, 23'h0};  // overflow → ±Inf
+                return {sign_r, exp_r, sig_sum[23:1]};
+            end else begin
+                return {sign_r, exp_big, sig_sum[22:0]};
+            end
+        end else begin
+            // Different sign: subtract (big - small, |big| >= |small| by construction)
+            sig_sum = {1'b0, sig_big} - {1'b0, sig_sml};
+            if (sig_sum[23:0] == 24'h0) return 32'h0000_0000;  // exact cancellation
+
+            // Normalize: find number of leading zeros in sig_sum[23:0]
+            // Loop: last iteration where sig_norm[k]=1 → norm_shift = 23 - k
+            norm_shift = 5'd23;
+            sig_norm   = sig_sum[23:0];
+            for (int k = 0; k <= 23; k++) begin
+                if (sig_norm[k]) norm_shift = 5'd23 - 5'(k);
+            end
+            sig_norm = sig_norm << norm_shift;
+
+            if (exp_big <= 8'(norm_shift)) return {sign_r, 31'h0};  // underflow → ±0
+            exp_r = exp_big - 8'(norm_shift);
+            return {sign_r, exp_r, sig_norm[22:0]};
+        end
+    endfunction
+
+    // ---------------------------------------------------------------------------
+    // [SCALE stage] INT32 → FP32 + exp_total adjust, registered
+    // ---------------------------------------------------------------------------
+    wire [31:0] red_sum_int32 = 32'($signed(red_in[LEVELS][0]));  // sign-extend REDW→32
+    wire [31:0] scale_comb    = fp32_exp_scale(int32_to_fp32($signed(red_sum_int32)), delayed_exp);
+
+    wire [31:0] pipe_scale_out;
     VX_pipe_register #(
         .DATAW (32),
-        .DEPTH (MUL_LATENCY + RED_LATENCY)
-    ) pipe_c (
+        .DEPTH (SCALE_LATENCY)
+    ) pipe_scale (
         .clk      (clk),
         .reset    (reset),
         .enable   (enable),
-        .data_in  (c_val[31:0]),
-        .data_out (delayed_c)
+        .data_in  (scale_comb),
+        .data_out (pipe_scale_out)
     );
 
     // ---------------------------------------------------------------------------
-    // [NEW] Partial Sum Alignment Stage (combinational, before pipe_acc)
-    //
-    // Phase 5: E8M0 bidirectional shift based on sign of delayed_exp.
-    //   delayed_exp >= 0 : left  shift (scale up)   P = dot <<< delayed_exp
-    //   delayed_exp <  0 : right shift (scale down)  P = dot >>> |delayed_exp|
-    //
-    // ALIGNED_W = REDW + 30 accommodates max effective left shift (+30 clamp).
-    // Signed saturate to INT32 before adding delayed_c.
-    //
-    // Clamp policy (matches simx AG_TCU_EXP_MAX/MIN):
-    //   exp > +30 → early saturation (shift_amt clamped to 30, saturates below)
-    //   exp < -31 → flush to zero    (shift_amt clamped to 31, result ≈ 0)
-    //
-    // Critical path: barrel-shift → comparators → MUX → 32-bit adder
-    // This fits within the existing ACC_LATENCY = 1 pipeline stage.
+    // [FADD stage] FP32_scaled + C(FP32) → FP32, registered
     // ---------------------------------------------------------------------------
-    wire is_rshift = delayed_exp[EXP_TOTAL-1]; // sign bit of signed EXP_TOTAL-bit exp
-    // Clamp to valid shift range before extracting 5-bit shift amount.
-    wire exp_overflow  = !is_rshift && ($signed(delayed_exp) > $signed(EXP_TOTAL'(30)));
-    wire exp_underflow =  is_rshift && ($signed(delayed_exp) < $signed(EXP_TOTAL'(-31)));
-    // Extract 5-bit shift amount: abs(delayed_exp), clamped to [0,31].
-    wire [4:0] shift_amt = exp_overflow  ? 5'd30
-                         : exp_underflow ? 5'd31
-                         : is_rshift     ? 5'($signed(-delayed_exp))
-                         :                 5'($signed(delayed_exp));
-
-    wire signed [ALIGNED_W-1:0] partial_aligned =
-        is_rshift ? (ALIGNED_W'($signed(red_in[LEVELS][0])) >>> shift_amt)
-                  : (ALIGNED_W'($signed(red_in[LEVELS][0])) <<< shift_amt);
-
-    // Signed INT32 saturation
-    localparam signed [ALIGNED_W-1:0] INT32_MAX = ALIGNED_W'(32'sh7FFF_FFFF);
-    localparam signed [ALIGNED_W-1:0] INT32_MIN = ALIGNED_W'(32'sh8000_0000);
-
-    wire overflow_pos = ($signed(partial_aligned) > $signed(INT32_MAX));
-    wire overflow_neg = ($signed(partial_aligned) < $signed(INT32_MIN));
-
-    wire [31:0] partial_sat =
-        overflow_pos ? 32'h7FFF_FFFF :
-        overflow_neg ? 32'h8000_0000 :
-        partial_aligned[31:0];
-
-    // ---------------------------------------------------------------------------
-    // Final accumulation — reuses existing pipe_acc structure
-    // ---------------------------------------------------------------------------
+    wire [31:0] fadd_comb = fp32_add(pipe_scale_out, delayed_c);
     wire [31:0] result;
 
-    wire [31:0] acc = partial_sat + delayed_c;
     VX_pipe_register #(
         .DATAW (32),
-        .DEPTH (1)
-    ) pipe_acc (
+        .DEPTH (FADD_LATENCY)
+    ) pipe_fadd (
         .clk      (clk),
         .reset    (reset),
         .enable   (enable),
-        .data_in  (acc),
+        .data_in  (fadd_comb),
         .data_out (result)
     );
 

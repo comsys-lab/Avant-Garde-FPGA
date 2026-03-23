@@ -11,21 +11,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// AG-TCU Operand Transformer — MX9 true flatten redesign
+// AG-TCU Operand Transformer — Phase 10 true-INT8 MX9 redesign
 //
 // Responsibilities:
 //   - Per-warp E8M0 scale context management (VX_tcu_scale_ctx register file)
-//   - LDSCALE: write scale_a/scale_b to scale_ctx
-//   - WMMA INT: read scale_ctx → exp_total + flatten {micro_exp,INT7} → INT8
-//   - WMMA FP:  read scale_ctx → exp_total (passthrough, no MX9 conversion)
-//   - LDTILE:  NOP (zero-gate rs1/rs2/rs3 entering FEDP)
-//   - Hazard:  stall LDSCALE/LDTILE if same warp has in-flight INT WMMA uops
+//   - Per-warp micro-exp context management (VX_tcu_micro_ctx register file)
+//   - LDSCALE:  write scale_a/scale_b to scale_ctx
+//   - LDMICRO:  write pair-shared micro_exp bits to micro_ctx
+//   - LDTILE:   NOP (zero-gate rs1/rs2/rs3 entering FEDP)
+//   - WMMA INT (fmt_s[3]=1 OR fmt_s==TCU_MX9_ID):
+//       flatten INT8 using micro_ctx → saturate(INT8 << mexp) → INT8
+//       MX9: also patch fmt_s to TCU_I8_ID so pe_switch routes to INT path
+//   - WMMA FP  (fmt_s[3]=0, not MX9): passthrough (BF16/FP16/FP32)
+//   - Hazard: stall LDSCALE/LDTILE/LDMICRO if same warp has in-flight INT WMMA uops
 //
-// Flatten algorithm (INT path WMMA only, fmt_s[3]=1, tcu_op=WMMA):
-//   Each rs_data byte = {micro_exp[MSB], INT7[6:0]}
-//   m8     = sign_ext7(byte[6:0])
-//   output = mexp ? m8 << 1 : m8    (element_value = m7 * 2^mexp)
-//   INT7 range [-64,+63]: x2 gives [-128,+126] — fits INT8, no overflow possible
+// Flatten algorithm (INT path WMMA only):
+//   Each byte is a standard INT8 (2's complement).
+//   pair0 (bytes 0,1) share micro_exp bit[0] from micro_ctx.
+//   pair1 (bytes 2,3) share micro_exp bit[1] from micro_ctx.
+//   flat = saturate_int8(int8_val << mexp_bit)
+//   Special: INT8_MIN (-128) << 1 → -256 → saturated to -128
+//            INT8(64) << 1 → 128 → saturated to +127
 //
 // Pipeline position (before pe_switch):
 //   [VX_tcu_operand_transformer] → pe_switch → {VX_tcu_fp, VX_tcu_int}
@@ -35,19 +41,18 @@
 //   execute_if_out — to pe_switch
 //
 // Timing (1-cycle registered):
-//   Cycle 0 (combinational): scale_ctx.read(wid) → exp_total, flatten (INT path only)
+//   Cycle 0 (combinational): scale_ctx.read(wid) → exp_total; micro_ctx.read(wid) → mexp
 //   Cycle 1 (registered):    execute_if_out.data latched with modified operands
 //
 // Feedback ports (INT path only):
 //   fedp_enable / result_fire / result_wid  — from VX_tcu_int
-//   FP path: no feedback; FP WMMA inflight not tracked (LDSCALE hazard is INT-only)
 //
 // EXT_AG_TCU_ENABLE inactive: not instantiated (bypassed in VX_tcu_unit).
 
 `include "VX_define.vh"
 
 module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
-    parameter PIPE_LATENCY_INT = 5   // VX_tcu_int: FEDP_LATENCY + 1 (mdata)
+    parameter PIPE_LATENCY_INT = 6   // VX_tcu_int: FEDP_LATENCY(5) + 1(mdata) = 6
 ) (
     input  wire clk,
     input  wire reset,
@@ -69,7 +74,8 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -------------------------------------------------------------------------
     wire is_ldscale_in = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_LDSCALE);
     wire is_ldtile_in  = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_LDTILE);
-    wire is_nop_in     = is_ldscale_in || is_ldtile_in;
+    wire is_ldmicro_in = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_LDMICRO);
+    wire is_nop_in     = is_ldscale_in || is_ldtile_in || is_ldmicro_in;
 
     // -------------------------------------------------------------------------
     // Scale context — per-warp E8M0 registers
@@ -96,20 +102,42 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         + $signed(TCU_EXP_TOTAL'({2'b0, rd_scale_b}))
         - $signed(TCU_EXP_TOTAL'(2 * TCU_EXP_BIAS));
 
-    wire signed [TCU_EXP_TOTAL-1:0] exp_total_ot = exp_total_comb;
+    // -------------------------------------------------------------------------
+    // Micro-exp context — per-warp, per-thread pair-shared micro_exp bits
+    // -------------------------------------------------------------------------
+    wire [`NUM_THREADS-1:0][1:0] rd_mexp_a, rd_mexp_b;
+
+    wire [`NUM_THREADS-1:0][1:0] wr_mexp_a_w, wr_mexp_b_w;
+    for (genvar t = 0; t < `NUM_THREADS; t++) begin : g_mexp_wr
+        assign wr_mexp_a_w[t] = execute_if_in.data.rs1_data[t][1:0];
+        assign wr_mexp_b_w[t] = execute_if_in.data.rs2_data[t][1:0];
+    end
+
+    VX_tcu_micro_ctx #(.NUM_WARPS(`NUM_WARPS)) micro_ctx (
+        .clk        (clk),
+        .reset      (reset),
+        // Write on LDMICRO fire at input
+        .wr_valid   (execute_if_in.valid && execute_if_in.ready && is_ldmicro_in),
+        .wr_wid     (execute_if_in.data.wid),
+        .wr_mexp_a  (wr_mexp_a_w),
+        .wr_mexp_b  (wr_mexp_b_w),
+        // Read combinationally by current wid
+        .rd_wid     (execute_if_in.data.wid),
+        .rd_mexp_a  (rd_mexp_a),
+        .rd_mexp_b  (rd_mexp_b)
+    );
 
     // -------------------------------------------------------------------------
-    // LDSCALE/LDTILE delay pipe — tracks NOP tokens through INT FEDP.
+    // LDSCALE/LDTILE/LDMICRO delay pipe — tracks NOP tokens through INT FEDP.
     // Shift enable: fedp_enable (same gating as VX_tcu_int's fedp_delay_pipe).
-    // Depth = PIPE_LATENCY_INT (VX_tcu_int: FEDP_LATENCY + mdata = 5).
-    // execute_fire_out pushes is_nop; result_fire is at pipe[0].
-    // Note: LDSCALE/LDTILE always route to INT path → no FP delay pipe needed.
+    // Depth = PIPE_LATENCY_INT (VX_tcu_int: FEDP_LATENCY + mdata = 6).
     // -------------------------------------------------------------------------
-    localparam DELAY_DEPTH = PIPE_LATENCY_INT;  // = 5 (VX_tcu_int internal latency)
+    localparam DELAY_DEPTH = PIPE_LATENCY_INT;
 
     // Track is_nop at the output side (after the 1-cycle register)
     wire is_nop_out = (execute_if_out.data.op_args.tcu.tcu_op == TCU_OP_LDSCALE)
-                   || (execute_if_out.data.op_args.tcu.tcu_op == TCU_OP_LDTILE);
+                   || (execute_if_out.data.op_args.tcu.tcu_op == TCU_OP_LDTILE)
+                   || (execute_if_out.data.op_args.tcu.tcu_op == TCU_OP_LDMICRO);
 
     wire execute_fire_out = execute_if_out.valid && execute_if_out.ready;
     wire is_fp_out  = !execute_if_out.data.op_args.tcu.fmt_s[3];  // FP when fmt_s[3]=0
@@ -128,13 +156,13 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // -------------------------------------------------------------------------
     // Per-warp in-flight WMMA uop counter (INT path only, fmt_s[3]=1)
-    // FP WMMA not tracked: FP WMMA past OT already has exp_total captured,
-    // so LDSCALE cannot corrupt in-flight FP results.
+    // FP WMMA not tracked: exp_total already captured in OT stage.
+    // Note: after OT patches MX9 → I8 (fmt_s[3]=1), MX9 WMMA is also counted.
     // -------------------------------------------------------------------------
     localparam INFLIGHT_W = $clog2(TCU_UOPS + 1);
     reg [INFLIGHT_W-1:0] wmma_inflight [`NUM_WARPS];
 
-    wire wmma_dispatched = execute_fire_out && !is_nop_out && !is_fp_out;  // INT path (fmt_s[3]=1)
+    wire wmma_dispatched = execute_fire_out && !is_nop_out && !is_fp_out;  // INT (fmt_s[3]=1)
     wire wmma_completed  = result_fire && !result_is_ldscale;
 
     always @(posedge clk) begin
@@ -151,59 +179,104 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
     end
 
-    // Hazard: stall LDSCALE/LDTILE if same warp has in-flight INT WMMA uops
+    // Hazard: stall LDSCALE/LDTILE/LDMICRO if same warp has in-flight INT WMMA uops
     wire ldscale_hazard = is_nop_in && (wmma_inflight[execute_if_in.data.wid] != '0);
 
     // -------------------------------------------------------------------------
-    // MX9 flatten helpers (INT path WMMA only: fmt_s[3]=1, tcu_op=WMMA)
-    // Each byte = {micro_exp[MSB], INT7[6:0]}
-    // element_value = m7 * 2^mexp → MAC input = mexp ? m8<<1 : m8
-    // INT7 range [-64,+63]: x2 gives [-128,+126] — fits INT8, no overflow
+    // INT8 flatten with saturation (INT path WMMA only)
+    //   flat = saturate_int8(int8_val << mexp)
+    //   For mexp=0: no change (passthrough).
+    //   For mexp=1: left-shift by 1 with INT8 saturation.
+    //     overflow_pos: int8_val[7]=0, int8_val[6]=1  → clamp to +127
+    //     overflow_neg: int8_val[7]=1, int8_val[6]=0  → clamp to -128
     // -------------------------------------------------------------------------
-    function automatic logic [7:0] flatten_mx9_byte(
-        input logic [7:0] byte_in
+    function automatic logic [7:0] flatten_int8_byte(
+        input logic [7:0] int8_in,
+        input logic       mexp
     );
-        logic              mexp;
-        logic signed [7:0] m8;
-        mexp = byte_in[7];                           // MSB = micro_exp
-        m8   = $signed({byte_in[6], byte_in[6:0]}); // sign_ext7 -> INT8
-        return mexp ? m8 <<< 1 : m8;
+        logic overflow_pos, overflow_neg;
+        if (!mexp) return int8_in;                         // mexp=0: passthrough
+        overflow_pos = (int8_in[7] == 1'b0) && (int8_in[6] == 1'b1);  // +overflow
+        overflow_neg = (int8_in[7] == 1'b1) && (int8_in[6] == 1'b0);  // -overflow
+        if (overflow_pos) return 8'h7F;
+        if (overflow_neg) return 8'h80;
+        return {int8_in[6:0], 1'b0};  // << 1
     endfunction
 
-    function automatic logic [31:0] flatten_mx9_word(input logic [31:0] word);
-        logic [31:0] res;
-        res[ 7: 0] = flatten_mx9_byte(word[ 7: 0]);
-        res[15: 8] = flatten_mx9_byte(word[15: 8]);
-        res[23:16] = flatten_mx9_byte(word[23:16]);
-        res[31:24] = flatten_mx9_byte(word[31:24]);
-        return res;
+    // Flatten a 32-bit word (4 INT8 bytes, 2 pairs)
+    //   mexp[0]: pair0 (bytes 0,1), mexp[1]: pair1 (bytes 2,3)
+    function automatic logic [31:0] flatten_int8_word(
+        input logic [31:0] word,
+        input logic [1:0]  mexp
+    );
+        return {flatten_int8_byte(word[31:24], mexp[1]),
+                flatten_int8_byte(word[23:16], mexp[1]),
+                flatten_int8_byte(word[15:8],  mexp[0]),
+                flatten_int8_byte(word[7:0],   mexp[0])};
     endfunction
 
-    // WMMA + INT path: always flatten (mexp=0 -> passthrough, no performance penalty)
-    // tcu_op == TCU_OP_WMMA required: LDSCALE/LDTILE may also have fmt_s[3]=1
-    wire do_flatten_mx9 = !is_nop_in
+    // INT WMMA trigger (fmt_s[3]=1, tcu_op=WMMA, not nop)
+    wire do_flatten_int = !is_nop_in
         && execute_if_in.data.op_args.tcu.fmt_s[3]
+        && (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_WMMA);
+
+    // MX9 WMMA trigger (fmt_s==TCU_MX9_ID, fmt_s[3]=0, tcu_op=WMMA, not nop)
+    // OT flattens INT8 using micro_ctx, then patches fmt_s → TCU_I8_ID
+    wire do_flatten_mx9 = !is_nop_in
+        && (execute_if_in.data.op_args.tcu.fmt_s == 4'(TCU_MX9_ID))
         && (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_WMMA);
 
     // -------------------------------------------------------------------------
     // 1-cycle registered pipeline stage (single-entry buffer)
     // -------------------------------------------------------------------------
-    // Stage register: use tcu_exe_t directly (Verilator requires struct type for
-    // member access; flat logic vector does NOT support field selects in Verilator).
     reg                 ot_valid;
-    tcu_exe_t           ot_data_r;  // holds one execute payload
+    tcu_exe_t           ot_data_r;
 
-    // Output stalls when stage is full and output not consumed
     wire ot_stall = ot_valid && !execute_if_out.ready;
 
-    // Input accepted when stage is not stalling and no hazard
     assign execute_if_in.ready  = !ot_stall && !ldscale_hazard;
-
-    // Output
     assign execute_if_out.valid = ot_valid;
     assign execute_if_out.data  = ot_data_r;
 
-    // Build modified data: fill exp_total, zero-gate nop operands, flatten INT WMMA
+    // -------------------------------------------------------------------------
+    // Combinational next-value computation
+    // -------------------------------------------------------------------------
+    tcu_exe_t ot_data_next;
+    always_comb begin
+        ot_data_next = execute_if_in.data;
+        // Insert exp_total into the tcu_args payload
+        ot_data_next.op_args.tcu.exp_total = exp_total_comb;
+
+        if (is_nop_in) begin
+            // Zero-gate operands for LDSCALE/LDTILE/LDMICRO (FEDP treats as NOP)
+            for (integer t = 0; t < `NUM_THREADS; t++) begin
+                ot_data_next.rs1_data[t] = '0;
+                ot_data_next.rs2_data[t] = '0;
+                ot_data_next.rs3_data[t] = '0;
+            end
+        end else if (do_flatten_mx9) begin
+            // MX9 INT WMMA: flatten INT8 using micro_ctx, patch fmt_s → I8
+            for (integer t = 0; t < `NUM_THREADS; t++) begin
+                ot_data_next.rs1_data[t] = flatten_int8_word(
+                    execute_if_in.data.rs1_data[t], rd_mexp_a[t]);
+                ot_data_next.rs2_data[t] = flatten_int8_word(
+                    execute_if_in.data.rs2_data[t], rd_mexp_b[t]);
+            end
+            // Patch: fmt_s → TCU_I8_ID so pe_switch routes to INT path
+            ot_data_next.op_args.tcu.fmt_s = 4'(TCU_I8_ID);
+        end else if (do_flatten_int) begin
+            // Plain INT8 WMMA: apply micro_ctx flatten (mexp=0 = passthrough if no LDMICRO)
+            for (integer t = 0; t < `NUM_THREADS; t++) begin
+                ot_data_next.rs1_data[t] = flatten_int8_word(
+                    execute_if_in.data.rs1_data[t], rd_mexp_a[t]);
+                ot_data_next.rs2_data[t] = flatten_int8_word(
+                    execute_if_in.data.rs2_data[t], rd_mexp_b[t]);
+            end
+        end
+        // FP WMMA (BF16/FP16/FP32): passthrough (exp_total already patched above)
+    end
+
+    // Build modified data: single NBA from combinational next value
     always @(posedge clk) begin
         if (reset) begin
             ot_valid <= 1'b0;
@@ -211,25 +284,7 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             if (!ot_stall) begin
                 ot_valid <= execute_if_in.valid && !ldscale_hazard;
                 if (execute_if_in.valid && !ldscale_hazard) begin
-                    // Copy all fields, then patch
-                    ot_data_r <= execute_if_in.data;
-                    // Insert exp_total into the tcu_args payload
-                    ot_data_r.op_args.tcu.exp_total <= exp_total_ot;
-                    // Zero-gate operands for LDSCALE/LDTILE (FEDP treats as NOP)
-                    if (is_nop_in) begin
-                        for (integer t = 0; t < `NUM_THREADS; t++) begin
-                            ot_data_r.rs1_data[t] <= '0;
-                            ot_data_r.rs2_data[t] <= '0;
-                            ot_data_r.rs3_data[t] <= '0;
-                        end
-                    end else if (do_flatten_mx9) begin
-                        // INT WMMA: flatten {micro_exp, INT7} -> INT8 ([8:1] truncation)
-                        for (integer t = 0; t < `NUM_THREADS; t++) begin
-                            ot_data_r.rs1_data[t] <= flatten_mx9_word(execute_if_in.data.rs1_data[t]);
-                            ot_data_r.rs2_data[t] <= flatten_mx9_word(execute_if_in.data.rs2_data[t]);
-                        end
-                    end
-                    // FP WMMA: passthrough (no MX9 conversion; exp_total already patched above)
+                    ot_data_r <= ot_data_next;
                 end
             end
         end

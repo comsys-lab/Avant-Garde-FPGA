@@ -63,7 +63,7 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [3:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [3:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
 
-    `UNUSED_VAR ({step_m, step_n, fmt_s, fmt_d});
+    `UNUSED_VAR ({step_m, step_n, fmt_s, fmt_d, execute_if.data.op_args.tcu.exp_total});
 
     wire [MDATA_WIDTH-1:0] mdata_queue_din, mdata_queue_dout;
     wire mdata_queue_full;
@@ -132,10 +132,11 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             wire [2:0] fmt_s_r, fmt_d_r;
             wire [TCU_TC_K-1:0][`XLEN-1:0] a_row_r, b_col_r;
             wire [`XLEN-1:0] c_val_r;
+            wire [TCU_EXP_TOTAL-1:0] exp_total_r;
 
             `BUFFER_EX (
-                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r},
-                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0]},
+                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r,    exp_total_r},
+                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0], execute_if.data.op_args.tcu.exp_total},
                 fedp_enable,
                 0, // resetw
                 1  // depth
@@ -158,18 +159,20 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             );
         `elsif TCU_BHF
             VX_tcu_fedp_bhf #(
-                .LATENCY (FEDP_LATENCY),
-                .N (TCU_TC_K)
+                .LATENCY     (FEDP_LATENCY),
+                .N           (TCU_TC_K),
+                .EXP_TOTAL_W (TCU_EXP_TOTAL)
             ) fedp (
-                .clk   (clk),
-                .reset (reset),
-                .enable(fedp_enable),
-                .fmt_s (fmt_s_r),
-                .fmt_d (fmt_d_r),
-                .a_row (a_row_r),
-                .b_col (b_col_r),
-                .c_val (c_val_r),
-                .d_val (d_val[i][j])
+                .clk      (clk),
+                .reset    (reset),
+                .enable   (fedp_enable),
+                .fmt_s    (fmt_s_r),
+                .fmt_d    (fmt_d_r),
+                .exp_total(exp_total_r),
+                .a_row    (a_row_r),
+                .b_col    (b_col_r),
+                .c_val    (c_val_r),
+                .d_val    (d_val[i][j])
             );
         `elsif TCU_DSP
             VX_tcu_fedp_dsp #(

@@ -3,16 +3,12 @@
 // DUT: VX_execute (all execution units) + VX_commit (priority arbiter)
 // Output monitored: VX_commit.writeback_if
 //
-// New vs Level 5:
-//   1. All execution units compiled together (multi-unit integration check)
-//   2. EX_TCU slot indexing in VX_execute verified
-//   3. VX_commit priority arbitration (EX_ALU > EX_TCU) tested
-//   4. Concurrent ALU + TCU execution verified
+// Phase 10 essential test cases:
+//   Group A (TC1,TC3-TC5): WMMA regression — INT8 → FP32 output (ref_d_fp32 model)
+//   Group B (TC6-TC7): ALU ADD standalone (format-agnostic)
+//   Group C (TC8-TC10): Concurrent ALU+TCU, priority arbitration, metadata passthrough
 //
-// Test groups:
-//   Group A (TC1-TC5): WMMA regression through VX_execute+VX_commit
-//   Group B (TC6-TC7): ALU ADD standalone
-//   Group C (TC8-TC10): Concurrent ALU+TCU, priority collision, metadata
+// TC2 (pos_sat with Phase 8A MX9 flatten) removed — behavior changed in Phase 10.
 
 `include "VX_define.vh"
 
@@ -134,46 +130,74 @@ module tb_execute;
     int pass_cnt = 0, fail_cnt = 0;
 
     // =========================================================================
-    // Reference model (same as Level 4 tb_tcu_unit)
+    // FP32 bit ↔ real conversion helpers (avoids shortreal/Verilator issues)
     // =========================================================================
-    function automatic logic signed [7:0] ref_flatten_mx9_byte(input logic [7:0] byte_in);
-        logic              mexp;
-        logic signed [7:0] m8;
-        mexp = byte_in[7];
-        m8   = $signed({byte_in[6], byte_in[6:0]});  // sign_ext7
-        return mexp ? m8 <<< 1 : m8;
+    // Convert IEEE 754 single-precision 32-bit pattern to real (double).
+    function automatic real fp32_to_real (input logic [31:0] bits);
+        logic        sign;
+        int          exp;
+        logic [22:0] mant;
+        real         r;
+        sign = bits[31];
+        exp  = int'(bits[30:23]) - 127;
+        mant = bits[22:0];
+        r = 1.0;
+        for (int b = 22; b >= 0; b--)
+            if (mant[b]) r += 2.0 ** (b - 23);  // bit 22 = 2^-1, bit 0 = 2^-23
+        r = r * (2.0 ** exp);
+        return sign ? -r : r;
     endfunction
 
-    function automatic logic signed [31:0] ref_d (
+    // Convert real to IEEE 754 single-precision 32-bit pattern (normalized only).
+    function automatic logic [31:0] real_to_fp32 (input real r);
+        logic        sign;
+        real         r_abs;
+        int          exp;
+        real         mant;
+        logic [22:0] mant_bits;
+        if (r == 0.0) return 32'h0;
+        sign  = (r < 0.0) ? 1'b1 : 1'b0;
+        r_abs = sign ? -r : r;
+        exp   = 0;
+        while (r_abs >= 2.0) begin r_abs /= 2.0; exp++; end
+        while (r_abs <  1.0) begin r_abs *= 2.0; exp--; end
+        mant = r_abs - 1.0;
+        mant_bits = '0;
+        for (int b = 22; b >= 0; b--) begin
+            mant *= 2.0;
+            if (mant >= 1.0) begin mant_bits[b] = 1'b1; mant -= 1.0; end
+        end
+        return {sign, 8'(exp + 127), mant_bits};
+    endfunction
+
+    // =========================================================================
+    // Reference model — Phase 10: INT8 → INT32 dot → FP32 output
+    //   Matches VX_tcu_fedp_int_scaled: int32_to_fp32 + fp32_exp_scale + fp32_add(C)
+    //   C (rs3) is stored as raw FP32 bits and interpreted as FP32.
+    // =========================================================================
+    function automatic logic [31:0] ref_d_fp32 (
         input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
         input logic signed [9:0] exp_total,
         input int i, j, b_off
     );
-        logic signed [31:0] dot;
-        logic signed [63:0] shifted;
-        logic signed [31:0] sat;
-        logic [4:0] rshift_amt;
+        int  dot;
+        real dot_f, scale_f, c_f, result_f;
+        int  exp_int;
 
         dot = '0;
         for (int k = 0; k < TCU_TC_K; k++)
             for (int b = 0; b < 4; b++) begin
-                logic signed [7:0] a8 = ref_flatten_mx9_byte(rs1[i * TCU_TC_K + k][8*b+7 -: 8]);
-                logic signed [7:0] b8 = ref_flatten_mx9_byte(rs2[b_off + j * TCU_TC_K + k][8*b+7 -: 8]);
-                dot += a8 * b8;
+                logic signed [7:0] a8 = rs1[i * TCU_TC_K + k][8*b+7 -: 8];
+                logic signed [7:0] b8 = rs2[b_off + j * TCU_TC_K + k][8*b+7 -: 8];
+                dot += int'(a8) * int'(b8);
             end
 
-        if (exp_total[9]) begin // sign bit = 1 → negative exp → right shift
-            rshift_amt = 5'($signed(-exp_total));
-            shifted = 64'($signed(dot)) >>> rshift_amt;
-        end else begin
-            shifted = 64'($signed(dot)) <<< exp_total;
-        end
-
-        if      (shifted > 64'sd2147483647)  sat = 32'h7FFF_FFFF;
-        else if (shifted < -64'sd2147483648) sat = 32'h8000_0000;
-        else                                 sat = shifted[31:0];
-
-        return sat + $signed(rs3[i * TCU_TC_N + j]);
+        exp_int  = int'($signed(exp_total));
+        dot_f    = real'(dot);
+        scale_f  = 2.0 ** exp_int;
+        c_f      = fp32_to_real(rs3[i * TCU_TC_N + j]);
+        result_f = dot_f * scale_f + c_f;
+        return real_to_fp32(result_f);
     endfunction
 
     // =========================================================================
@@ -225,12 +249,36 @@ module tb_execute;
         pkt                    = build_base_pkt(ld_uuid, '0);
         pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
         pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-        pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
         pkt.op_args.tcu.tcu_op = TCU_OP_LDSCALE;
         // Scale packed into rs1_data[0]: [15:8]=scale_b, [7:0]=scale_a
         pkt.rs1_data[0]        = {16'b0, scale_b, scale_a};
         fire_tcu(pkt);
         wait_writeback_uuid(ld_uuid, dummy);
+    endtask
+
+    // fire_ldmicro_tcu: sends LDMICRO to VX_tcu_operand_transformer via execute.
+    //   mexp_a[1:0] = {pair1_a, pair0_a}, mexp_b[1:0] = {pair1_b, pair0_b}
+    //   wb=0: no GPR writeback → wait_writeback_uuid NOT called.
+    task automatic fire_ldmicro_tcu(
+        input logic [1:0] mexp_a, mexp_b);
+        dispatch_t pkt;
+        logic [UUID_WIDTH-1:0] ld_uuid;
+        ld_uuid                    = next_uuid++;
+        pkt                        = build_base_pkt(ld_uuid, '0);
+        pkt.wb                     = 1'b0;  // no GPR writeback
+        pkt.op_type                = INST_ALU_BITS'(INST_TCU_WMMA);
+        pkt.op_args.tcu.fmt_s      = 4'(TCU_I8_ID);
+        pkt.op_args.tcu.fmt_d      = 4'(TCU_FP32_ID);
+        pkt.op_args.tcu.tcu_op     = TCU_OP_LDMICRO;
+        for (int t = 0; t < `SIMD_WIDTH; t++) begin
+            pkt.rs1_data[t] = {30'b0, mexp_a};
+            pkt.rs2_data[t] = {30'b0, mexp_b};
+        end
+        fire_tcu(pkt);
+        // LDMICRO has wb=0: OT stores micro_exp into micro_ctx register.
+        // It still passes through execute pipeline; allow 2 cycles for OT latch.
+        repeat(2) @(posedge clk);
     endtask
 `endif
 
@@ -310,7 +358,7 @@ module tb_execute;
         pkt                    = build_base_pkt(my_uuid, NUM_REGS_BITS'(2));
         pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
         pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-        pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);  // Phase 10: INT FEDP outputs FP32
         pkt.op_args.tcu.step_m = step_m;
         pkt.op_args.tcu.step_n = step_n;
 `ifdef EXT_AG_TCU_ENABLE
@@ -329,11 +377,97 @@ module tb_execute;
         test_pass = 1;
         for (int i = 0; i < TCU_TC_M; i++) begin
             for (int j = 0; j < TCU_TC_N; j++) begin
-                logic signed [31:0] got, exp_val;
-                got     = $signed(res.data[i * TCU_TC_N + j]);
-                exp_val = ref_d(rs1, rs2, rs3, exp_total, i, j, b_off);
+                logic [31:0] got, exp_val;
+                got     = res.data[i * TCU_TC_N + j];
+                exp_val = ref_d_fp32(rs1, rs2, rs3, exp_total, i, j, b_off);
                 if (got !== exp_val) begin
-                    $display("[FAIL] %-30s [%0d][%0d] got=%0d exp=%0d",
+                    $display("[FAIL] %-30s [%0d][%0d] got=0x%08h exp=0x%08h",
+                             name, i, j, got, exp_val);
+                    test_pass = 0;
+                end
+            end
+        end
+        if (test_pass) begin
+            $display("[PASS] %-30s all %0d outputs correct",
+                     name, TCU_TC_M * TCU_TC_N);
+            pass_cnt++;
+        end else begin
+            fail_cnt++;
+        end
+    // =========================================================================
+    // run_mx9_test (Phase 10)
+    //   Fires LDSCALE + LDMICRO + MX9 WMMA dispatch.
+    //   Reference model applies flatten before dot: rs1_flat = flatten(rs1, mexp_a).
+    // =========================================================================
+
+    // Phase 10 flatten: shift left by mexp (1-bit), saturate at INT8 bounds.
+    function automatic logic [7:0] ref_flatten_byte(
+        input logic [7:0] b, input logic mexp);
+        if (!mexp) return b;
+        // mexp=1: result = b << 1 with saturation
+        if (b[7] == 1'b0 && b[6] == 1'b1) return 8'h7F;  // +127 sat
+        if (b[7] == 1'b1 && b[6] == 1'b0) return 8'h80;  // -128 sat
+        return {b[6:0], 1'b0};
+    endfunction
+
+    function automatic logic [31:0] ref_flatten_word(
+        input logic [31:0] w, input logic [1:0] mexp);
+        return {ref_flatten_byte(w[31:24], mexp[1]),
+                ref_flatten_byte(w[23:16], mexp[1]),
+                ref_flatten_byte(w[15:8],  mexp[0]),
+                ref_flatten_byte(w[7:0],   mexp[0])};
+    endfunction
+
+`ifdef EXT_AG_TCU_ENABLE
+    task automatic run_mx9_test (
+        input string name,
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic [7:0] exp_a, exp_b,
+        input logic [1:0] mexp_a, mexp_b  // uniform across all threads
+    );
+        dispatch_t  pkt;
+        writeback_t res;
+        logic signed [9:0] exp_total;
+        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_flat, rs2_flat;
+        int         b_off;
+        bit         test_pass;
+        logic [UUID_WIDTH-1:0] my_uuid;
+
+        my_uuid   = next_uuid++;
+        exp_total = $signed({2'b0, exp_a}) + $signed({2'b0, exp_b}) - 10'sd254;
+        b_off     = 0;
+
+        // Apply flatten to match OT behaviour
+        for (int t = 0; t < `SIMD_WIDTH; t++) begin
+            rs1_flat[t] = ref_flatten_word(rs1[t], mexp_a);
+            rs2_flat[t] = ref_flatten_word(rs2[t], mexp_b);
+        end
+
+        pkt                    = build_base_pkt(my_uuid, NUM_REGS_BITS'(2));
+        pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
+        pkt.op_args.tcu.fmt_s  = 4'(TCU_MX9_ID);    // OT: flatten + patch to I8
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
+        pkt.op_args.tcu.step_m = 4'd0;
+        pkt.op_args.tcu.step_n = 4'd0;
+        pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
+        pkt.rs1_data           = rs1;
+        pkt.rs2_data           = rs2;
+        pkt.rs3_data           = rs3;
+
+        fire_ldscale_tcu(exp_a, exp_b);
+        fire_ldmicro_tcu(mexp_a, mexp_b);
+        fire_tcu(pkt);
+        wait_writeback_uuid(my_uuid, res);
+
+        test_pass = 1;
+        for (int i = 0; i < TCU_TC_M; i++) begin
+            for (int j = 0; j < TCU_TC_N; j++) begin
+                logic [31:0] got, exp_val;
+                got     = res.data[i * TCU_TC_N + j];
+                // Reference uses FLATTENED rs1/rs2
+                exp_val = ref_d_fp32(rs1_flat, rs2_flat, rs3, exp_total, i, j, b_off);
+                if (got !== exp_val) begin
+                    $display("[FAIL] %-30s [%0d][%0d] got=0x%08h exp=0x%08h",
                              name, i, j, got, exp_val);
                     test_pass = 0;
                 end
@@ -347,6 +481,7 @@ module tb_execute;
             fail_cnt++;
         end
     endtask
+`endif // EXT_AG_TCU_ENABLE
 
     // =========================================================================
     // run_alu_test
@@ -425,7 +560,7 @@ module tb_execute;
         tcu_pkt                    = build_base_pkt(tcu_uuid, NUM_REGS_BITS'(2));
         tcu_pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
         tcu_pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-        tcu_pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
+        tcu_pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);  // Phase 10
         tcu_pkt.op_args.tcu.step_m = 4'd0;
         tcu_pkt.op_args.tcu.step_n = 4'd0;
 `ifdef EXT_AG_TCU_ENABLE
@@ -478,11 +613,11 @@ module tb_execute;
         // Verify TCU result
         for (int i = 0; i < TCU_TC_M; i++) begin
             for (int j = 0; j < TCU_TC_N; j++) begin
-                logic signed [31:0] got, exp_val;
-                got     = $signed(tcu_res.data[i * TCU_TC_N + j]);
-                exp_val = ref_d(tcu_rs1, tcu_rs2, tcu_rs3, exp_total, i, j, 0);
+                logic [31:0] got, exp_val;
+                got     = tcu_res.data[i * TCU_TC_N + j];
+                exp_val = ref_d_fp32(tcu_rs1, tcu_rs2, tcu_rs3, exp_total, i, j, 0);
                 if (got !== exp_val) begin
-                    $display("[FAIL] %-30s TCU[%0d][%0d] got=%0d exp=%0d",
+                    $display("[FAIL] %-30s TCU[%0d][%0d] got=0x%08h exp=0x%08h",
                              name, i, j, got, exp_val);
                     test_pass = 0;
                 end
@@ -525,30 +660,25 @@ module tb_execute;
         // Group A: TCU regression (key cases from Level 4)
         // ====================================================================
 
-        // TC1: ones × ones, exp=0 → dot = TC_K*4*1*1 = 8
+        // TC1: ones × ones, exp=0 → dot=8 → FP32(8.0)=0x41000000
         run_tcu_test("TC1_wmma_ones_exp0",
             fill(32'h01010101), fill(32'h01010101), fill(32'd0),
             8'd127, 8'd127);
 
-        // TC2: positive saturation — (-128)×(-128), exp_total=+14 → INT32_MAX
-        // 0xC0 flatten 시 -> mexp=1, m7=-64 -> -128
-        run_tcu_test("TC2_wmma_pos_sat",
-            fill(32'hC0C0C0C0), fill(32'hC0C0C0C0), fill(32'd0),
-            8'd134, 8'd134);
-
-        // TC3: right-shift (Phase 4② coverage) — exp_total=-2, dot=8 → 8>>>2=2
+        // TC3: right-shift — exp_total=-2, dot=8 → FP32(8*0.25)=FP32(2.0)=0x40000000
         run_tcu_test("TC3_rshift_ones",
             fill(32'h01010101), fill(32'h01010101), fill(32'd0),
             8'd125, 8'd127);
 
-        // TC4: MX-style, exp_total=6 → dot=20, 20<<6=1280
+        // TC4: mixed bytes, exp_total=6 → dot=20 → FP32(20*64)=FP32(1280.0)=0x44A00000
         run_tcu_test("TC4_wmma_mx_style",
             fill(32'h04030201), fill(32'h01010101), fill(32'd0),
             8'd130, 8'd130);
 
-        // TC5: negative C accumulator → 8 + (-200) = -192
+        // TC5: FP32 negative C — FP32(8.0) + FP32(-200.0) = FP32(-192.0)
+        //   C preloaded as FP32(-200.0)=0xC3480000; expected = FP32(-192.0)=0xC3400000
         run_tcu_test("TC5_wmma_neg_accum",
-            fill(32'h01010101), fill(32'h01010101), fill(-32'd200),
+            fill(32'h01010101), fill(32'h01010101), fill(32'hC3480000),
             8'd127, 8'd127);
 
         // ====================================================================
@@ -595,7 +725,7 @@ module tb_execute;
             pkt                    = build_base_pkt(test_uuid, test_rd);
             pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
             pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-            pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
+            pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);  // Phase 10
             pkt.op_args.tcu.step_m = 4'd0;
             pkt.op_args.tcu.step_n = 4'd0;
             pkt.rs1_data           = fill(32'h01010101);
@@ -629,6 +759,30 @@ module tb_execute;
                 fail_cnt++;
             end
         end
+
+`ifdef EXT_AG_TCU_ENABLE
+        // ====================================================================
+        // Group D: MX9 + LDMICRO [Phase 10]
+        // ====================================================================
+
+        // TC11: MX9 with mexp_a=1 (all pairs), mexp_b=0, exp_total=0
+        //   A=0x01010101 → flatten → A_flat=0x02020202
+        //   B=0x01010101 → identity → B_flat=0x01010101
+        //   dot = TC_K * 4 bytes * 2*1 = 8*2 = 16
+        //   FP32(16.0) + C(0.0) = FP32(16.0) = 0x41800000
+        run_mx9_test("TC11_mx9_mexp_a1",
+            fill(32'h01010101), fill(32'h01010101), fill(32'h00000000),
+            8'd127, 8'd127,
+            2'b11, 2'b00);   // mexp_a: pair0=1, pair1=1; mexp_b: all 0
+
+        // TC12: MX9 with mexp_a=1, exp_total=+2 (OT flatten × global exp scale)
+        //   A_flat=0x02020202, B_flat=0x01010101
+        //   dot=16, exp_total=2 → FP32(16 * 4) = FP32(64.0) = 0x42800000
+        run_mx9_test("TC12_mx9_mexp_a1_exp2",
+            fill(32'h01010101), fill(32'h01010101), fill(32'h00000000),
+            8'd129, 8'd127,   // exp_total = 129+127-254 = +2
+            2'b11, 2'b00);
+`endif
 
         // ==================================================================
         // Summary
