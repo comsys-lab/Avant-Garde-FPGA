@@ -1103,7 +1103,11 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
               ++steps;
               auto instr = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
               instr->setOpType(TcuType::WMMA);
-              instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, m, n});
+#ifdef EXT_AG_TCU_ENABLE
+              instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, (uint32_t)m, (uint32_t)n, 0}); // tcu_op=0
+#else
+              instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, (uint32_t)m, (uint32_t)n});
+#endif
               instr->setDestReg(rs3, RegType::Float);
               instr->setSrcReg(0, rs1, RegType::Float);
               instr->setSrcReg(1, rs2, RegType::Float);
@@ -1117,6 +1121,29 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         std::abort();
       }
     } break;
+#ifdef EXT_AG_TCU_ENABLE
+    case 6: { // LDSCALE (funct7=0x06, funct3=0x0): Load Scale Context
+      // Encoding: opcode=CUSTOM0(0x0B), funct7=0x06, funct3=0x0
+      // rs1 = integer reg, packed: [7:0]=scale_a, [15:8]=scale_b (E8M0); rd=x0 (no writeback)
+      auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+      instr->setOpType(TcuType::LDSCALE);
+      instr->setArgs(IntrTcuArgs{0, 0, 0, 0, 1}); // tcu_op=LDSCALE=1, tile_type=0
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0x07: // LDTILE_A (tile_type=0): funct7[6:3]=0b0000, funct7[2:0]=3'b111
+    case 0x0F: // LDTILE_B (tile_type=1): funct7[6:3]=0b0001, funct7[2:0]=3'b111
+    case 0x17: { // LDTILE_C (tile_type=2): funct7[6:3]=0b0010, funct7[2:0]=3'b111
+      // Encoding: opcode=CUSTOM0(0x0B), funct7[2:0]=3'b111, funct7[6:3]=tile_type
+      // rs1 = integer reg holding base address (one per thread); no explicit rd
+      uint32_t tile_type = (funct7 >> 3) & 0x3;
+      auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+      instr->setOpType(TcuType::LDTILE);
+      instr->setArgs(IntrTcuArgs{0, 0, 0, 0, 2, tile_type}); // tcu_op=LDTILE=2
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+#endif
   #endif
     default:
       std::abort();

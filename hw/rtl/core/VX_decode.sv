@@ -538,7 +538,7 @@ module VX_decode import VX_gpu_pkg::*; #(
                     end
                 `endif
                 `ifdef EXT_AG_TCU_ENABLE
-                    // AG-TCU LDSCALE / LDTILE: funct7[2:0] == 3'b110 or 3'b111
+                    // AG-TCU LDSCALE / LDTILE / LDMICRO: funct7[2:0] == 3'b110 / 3'b111 / 3'b100
                     default: begin
                         if (funct7[2:0] == 3'b110) begin
                             // LDSCALE: loads E8M0 scale context into per-warp VX_tcu_scale_ctx.
@@ -572,6 +572,26 @@ module VX_decode import VX_gpu_pkg::*; #(
                                     op_args.tcu.tcu_op   = TCU_OP_LDTILE;
                                     op_args.tcu.tile_type = funct7[4:3];
                                     `USED_IREG (rs1);
+                                end
+                                default:;
+                            endcase
+                        end else if (funct7[2:0] == 3'b100) begin
+                            // LDMICRO: loads pair-shared micro-exp bits into per-warp VX_tcu_micro_ctx.
+                            // rs1 = integer reg: mexp_a[1:0] per thread {pair1_mexp, pair0_mexp}
+                            // rs2 = integer reg: mexp_b[1:0] per thread
+                            // Encoding: {7'h04, rs2, rs1, 3'h0, 5'h0, opcode}
+                            case (funct3)
+                                3'h0: begin // LDMICRO
+                                    ex_type = EX_TCU;
+                                    op_type = INST_OP_BITS'(INST_TCU_WMMA);
+                                    op_args.tcu.fmt_s  = '0;
+                                    op_args.tcu.fmt_d  = '0;
+                                    op_args.tcu.step_m = '0;
+                                    op_args.tcu.step_n = '0;
+                                    op_args.tcu.tcu_op   = TCU_OP_LDMICRO;
+                                    op_args.tcu.tile_type = '0;
+                                    `USED_IREG (rs1);
+                                    `USED_IREG (rs2);
                                 end
                                 default:;
                             endcase

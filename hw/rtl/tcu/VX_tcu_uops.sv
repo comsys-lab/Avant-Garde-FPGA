@@ -61,15 +61,25 @@ module VX_tcu_uops import
         assign k_index = 0;
     end
 
-    // Register offsets
+    // Register offsets (WMMA)
     wire [CTR_W-1:0] rs1_offset = ((CTR_W'(m_index) >> LG_A_SB) << LG_K) | CTR_W'(k_index);
     wire [CTR_W-1:0] rs2_offset = ((CTR_W'(k_index) << LG_N) | CTR_W'(n_index)) >> LG_B_SB;
     wire [CTR_W-1:0] rs3_offset = (CTR_W'(m_index) << LG_N) | CTR_W'(n_index);
 
-    // Register calculations
+    // Register calculations (WMMA)
     wire [4:0] rs1 = TCU_RA + 5'(rs1_offset);
     wire [4:0] rs2 = TCU_RB + 5'(rs2_offset);
     wire [4:0] rs3 = TCU_RC + 5'(rs3_offset);
+
+`ifdef EXT_AG_TCU_ENABLE
+    wire is_flat = (ibuf_in.op_args.tcu.tcu_op == TCU_OP_FLAT);
+
+    // FLAT tile register index (counter 0..NRA-1 = A tile, NRA..FLAT_UOPS-1 = B tile)
+    wire flat_is_b = (counter >= CTR_W'(TCU_NRA));
+    wire [4:0] flat_reg = flat_is_b
+        ? 5'(TCU_RB + (counter - CTR_W'(TCU_NRA)))
+        : 5'(TCU_RA + counter);
+`endif
 
 `ifdef UUID_ENABLE
     wire [31:0] uuid_lo = {counter, ibuf_in.uuid[0 +: (32-CTR_W)]};
@@ -86,19 +96,28 @@ module VX_tcu_uops import
     assign ibuf_out.op_type   = ibuf_in.op_type;
     assign ibuf_out.op_args.tcu.fmt_s  = ibuf_in.op_args.tcu.fmt_s;
     assign ibuf_out.op_args.tcu.fmt_d  = ibuf_in.op_args.tcu.fmt_d;
+`ifdef EXT_AG_TCU_ENABLE
+    assign ibuf_out.op_args.tcu.step_m    = is_flat ? '0              : 4'(m_index);
+    assign ibuf_out.op_args.tcu.step_n    = is_flat ? '0              : 4'(n_index);
+    assign ibuf_out.op_args.tcu.tcu_op    = is_flat ? TCU_OP_FLAT     : TCU_OP_WMMA;
+    assign ibuf_out.op_args.tcu.tile_type = is_flat ? {1'b0, flat_is_b} : 2'b00;
+`else
     assign ibuf_out.op_args.tcu.step_m = 4'(m_index);
     assign ibuf_out.op_args.tcu.step_n = 4'(n_index);
-`ifdef EXT_AG_TCU_ENABLE
-    // AG-TCU: all microops from uop_sequencer are WMMA type
-    // (LDSCALE is excluded from uop expansion by VX_uop_sequencer).
-    assign ibuf_out.op_args.tcu.tcu_op = TCU_OP_WMMA;
 `endif
     assign ibuf_out.wb        = 1;
     assign ibuf_out.used_rs   = ibuf_in.used_rs;
+`ifdef EXT_AG_TCU_ENABLE
+    assign ibuf_out.rs1 = is_flat ? make_reg_num(REG_TYPE_F, flat_reg) : make_reg_num(REG_TYPE_F, rs1);
+    assign ibuf_out.rs2 = is_flat ? make_reg_num(REG_TYPE_F, rs2)      : make_reg_num(REG_TYPE_F, rs2);
+    assign ibuf_out.rs3 = is_flat ? make_reg_num(REG_TYPE_F, rs3)      : make_reg_num(REG_TYPE_F, rs3);
+    assign ibuf_out.rd  = is_flat ? make_reg_num(REG_TYPE_F, flat_reg) : make_reg_num(REG_TYPE_F, rs3);
+`else
     assign ibuf_out.rs1       = make_reg_num(REG_TYPE_F, rs1);
     assign ibuf_out.rs2       = make_reg_num(REG_TYPE_F, rs2);
     assign ibuf_out.rs3       = make_reg_num(REG_TYPE_F, rs3);
     assign ibuf_out.rd        = make_reg_num(REG_TYPE_F, rs3);
+`endif
     `UNUSED_VAR (ibuf_in.wb)
     `UNUSED_VAR (ibuf_in.rd)
     `UNUSED_VAR (ibuf_in.rs1)
@@ -114,11 +133,22 @@ module VX_tcu_uops import
             done    <= 0;
         end else begin
             if (~busy && start) begin
-                busy <= 1;
+                busy    <= 1;
+                counter <= '0;  // reset counter on each new instruction
+`ifdef EXT_AG_TCU_ENABLE
+                done <= is_flat ? 1'b0 : (TCU_UOPS == 1);
+`else
                 done <= (TCU_UOPS == 1);
+`endif
             end else if (busy && next) begin
-                counter <= counter + ((TCU_UOPS > 1) ? 1 : 0);
+                counter <= counter + CTR_W'(1);
+`ifdef EXT_AG_TCU_ENABLE
+                done <= is_flat
+                    ? (counter == CTR_W'(TCU_FLAT_UOPS-2))
+                    : (counter == CTR_W'(TCU_UOPS-2));
+`else
                 done <= (counter == CTR_W'(TCU_UOPS-2));
+`endif
                 busy <= ~done;
             end
         end

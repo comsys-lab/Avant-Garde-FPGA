@@ -235,8 +235,37 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Non-AG build: these are used in the else branch above
 `endif
 
+`ifdef EXT_AG_TCU_ENABLE
+    // FLAT bypass pipeline: carry rs1_data through PIPE_LATENCY stages.
+    // When is_flat_pipe[0]=1, output rs1_data instead of FEDP d_val.
+    localparam FLAT_DATA_W = `NUM_THREADS * `XLEN;
+    wire is_flat_in_w = (execute_if.data.op_args.tcu.tcu_op == TCU_OP_FLAT);
+    reg [FLAT_DATA_W-1:0] flat_data_pipe [PIPE_LATENCY];
+    reg                   is_flat_pipe   [PIPE_LATENCY];
+    always @(posedge clk) begin
+        if (reset) begin
+            for (integer p = 0; p < PIPE_LATENCY; p++) begin
+                flat_data_pipe[p] <= '0;
+                is_flat_pipe[p]   <= 1'b0;
+            end
+        end else if (fedp_enable) begin
+            for (integer p = 0; p < PIPE_LATENCY-1; p++) begin
+                flat_data_pipe[p] <= flat_data_pipe[p+1];
+                is_flat_pipe[p]   <= is_flat_pipe[p+1];
+            end
+            flat_data_pipe[PIPE_LATENCY-1] <= execute_fire
+                ? {>>{execute_if.data.rs1_data}} : FLAT_DATA_W'(0);
+            is_flat_pipe  [PIPE_LATENCY-1] <= execute_fire && is_flat_in_w;
+        end
+    end
+`endif
+
     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
+`ifdef EXT_AG_TCU_ENABLE
+    assign result_if.data.data  = is_flat_pipe[0] ? flat_data_pipe[0] : {>>{d_val}};
+`else
     assign result_if.data.data  = d_val;
+`endif
     assign result_if.data.pid = 0;
     assign result_if.data.sop = 1;
     assign result_if.data.eop = 1;

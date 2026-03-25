@@ -40,6 +40,8 @@ package VX_tcu_pkg;
     localparam TCU_FP16_ID = 1;
     localparam TCU_BF16_ID = 2;
     localparam TCU_MX9_ID  = 4;  // MX9: INT8 2's comp, micro_exp via LDMICRO; OT flattens+patches fmt_s→I8_ID (INT path)
+    localparam TCU_FP8E4M3_ID  = 5;  // FP8: E4M3 (4-bit unsigned exp with bias=7, 3-bit unsigned mantissa); micro_exp via LDMICRO; OT flattens+patches fmt_s→I8_ID (INT path)
+    localparam TCU_FP8E5M2_ID  = 6;  // FP8: E5M2 (5-bit unsigned exp with bias=15, 2-bit unsigned mantissa); micro_exp via LDMICRO; OT flattens+patches fmt_s→I8_ID (INT path)    
     localparam TCU_I32_ID  = 8;
     localparam TCU_I8_ID   = 9;
     localparam TCU_U8_ID   = 10;
@@ -80,7 +82,7 @@ package VX_tcu_pkg;
     localparam TCU_B_SUB_BLOCKS = TCU_BLOCK_CAP / TCU_B_BLOCK_SIZE;
 
     // Register counts
-    //localparam TCU_NRA = (TCU_TILE_M * TCU_TILE_K) / TCU_NT;
+    localparam TCU_NRA = (TCU_TILE_M * TCU_TILE_K) / TCU_NT;
     localparam TCU_NRB = (TCU_TILE_N * TCU_TILE_K) / TCU_NT;
     //localparam TCU_NRC = (TCU_TILE_M * TCU_TILE_N) / TCU_NT;
 
@@ -89,7 +91,8 @@ package VX_tcu_pkg;
     localparam TCU_RB = (TCU_NRB == 4) ? 28 : 10;
     localparam TCU_RC = (TCU_NRB == 4) ? 10 : 24;
 
-    localparam TCU_UOPS = TCU_M_STEPS * TCU_N_STEPS * TCU_K_STEPS;
+    localparam TCU_UOPS      = TCU_M_STEPS * TCU_N_STEPS * TCU_K_STEPS;
+    localparam TCU_FLAT_UOPS = TCU_NRA + TCU_NRB;
 
     // Tracing info
 `ifdef SIMULATION

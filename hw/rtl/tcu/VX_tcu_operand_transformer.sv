@@ -12,15 +12,16 @@
 // limitations under the License.
 
 // AG-TCU Operand Transformer — Phase 10 true-INT8 MX9 redesign
+//                              Phase C: META_BITS/LOG2_GROUP_SIZE parameterization
 //
 // Responsibilities:
 //   - Per-warp E8M0 scale context management (VX_tcu_scale_ctx register file)
-//   - Per-warp micro-exp context management (VX_tcu_micro_ctx register file)
+//   - Per-warp metadata context management (VX_tcu_micro_ctx register file)
 //   - LDSCALE:  write scale_a/scale_b to scale_ctx
-//   - LDMICRO:  write pair-shared micro_exp bits to micro_ctx
+//   - LDMICRO:  write per-group metadata bits to micro_ctx
 //   - LDTILE:   NOP (zero-gate rs1/rs2/rs3 entering FEDP)
 //   - WMMA INT (fmt_s[3]=1 OR fmt_s==TCU_MX9_ID):
-//       flatten INT8 using micro_ctx → saturate(INT8 << mexp) → INT8
+//       flatten INT8 using micro_ctx → saturate(INT8 << decode_meta(meta, fmt_s)) → INT8
 //       MX9: also patch fmt_s to TCU_I8_ID so pe_switch routes to INT path
 //   - WMMA FP  (fmt_s[3]=0, not MX9): passthrough (BF16/FP16/FP32)
 //   - Hazard: stall LDSCALE/LDTILE/LDMICRO if same warp has in-flight INT WMMA uops
@@ -52,7 +53,9 @@
 `include "VX_define.vh"
 
 module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
-    parameter PIPE_LATENCY_INT = 6   // VX_tcu_int: FEDP_LATENCY(5) + 1(mdata) = 6
+    parameter PIPE_LATENCY_INT = 6,  // VX_tcu_int: FEDP_LATENCY(5) + 1(mdata) = 6
+    parameter META_BITS        = 1,  // bits per ctx entry (format-agnostic); default=1 → Phase A identical
+    parameter LOG2_GROUP_SIZE  = 1   // default=1 → GROUP_SIZE=2 (pair-shared, MX9 behavior)
 ) (
     input  wire clk,
     input  wire reset,
@@ -75,6 +78,7 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire is_ldscale_in = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_LDSCALE);
     wire is_ldtile_in  = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_LDTILE);
     wire is_ldmicro_in = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_LDMICRO);
+    wire is_flat_in    = (execute_if_in.data.op_args.tcu.tcu_op == TCU_OP_FLAT);
     wire is_nop_in     = is_ldscale_in || is_ldtile_in || is_ldmicro_in;
 
     // -------------------------------------------------------------------------
@@ -103,28 +107,39 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         - $signed(TCU_EXP_TOTAL'(2 * TCU_EXP_BIAS));
 
     // -------------------------------------------------------------------------
-    // Micro-exp context — per-warp, per-thread pair-shared micro_exp bits
+    // Metadata context — per-warp, per-thread, per-group bits
+    // Phase C: META_BITS-wide per ctx entry, N_CTX entries per thread
+    //   N_CTX = (XLEN/8) >> LOG2_GROUP_SIZE  (default=2, pair-shared)
+    //   CTX_W = N_CTX * META_BITS            (default=2 bits → Phase A identical)
     // -------------------------------------------------------------------------
-    wire [`NUM_THREADS-1:0][1:0] rd_mexp_a, rd_mexp_b;
+    localparam N_BYTES = `XLEN / 8;
+    localparam N_CTX   = N_BYTES >> LOG2_GROUP_SIZE;
+    localparam CTX_W   = N_CTX * META_BITS;
 
-    wire [`NUM_THREADS-1:0][1:0] wr_mexp_a_w, wr_mexp_b_w;
-    for (genvar t = 0; t < `NUM_THREADS; t++) begin : g_mexp_wr
-        assign wr_mexp_a_w[t] = execute_if_in.data.rs1_data[t][1:0];
-        assign wr_mexp_b_w[t] = execute_if_in.data.rs2_data[t][1:0];
+    wire [`NUM_THREADS-1:0][CTX_W-1:0] rd_meta_a, rd_meta_b;
+
+    wire [`NUM_THREADS-1:0][CTX_W-1:0] wr_meta_a_w, wr_meta_b_w;
+    for (genvar t = 0; t < `NUM_THREADS; t++) begin : g_meta_wr
+        assign wr_meta_a_w[t] = execute_if_in.data.rs1_data[t][CTX_W-1:0];
+        assign wr_meta_b_w[t] = execute_if_in.data.rs2_data[t][CTX_W-1:0];
     end
 
-    VX_tcu_micro_ctx #(.NUM_WARPS(`NUM_WARPS)) micro_ctx (
+    VX_tcu_micro_ctx #(
+        .NUM_WARPS       (`NUM_WARPS),
+        .META_BITS       (META_BITS),
+        .LOG2_GROUP_SIZE (LOG2_GROUP_SIZE)
+    ) micro_ctx (
         .clk        (clk),
         .reset      (reset),
         // Write on LDMICRO fire at input
         .wr_valid   (execute_if_in.valid && execute_if_in.ready && is_ldmicro_in),
         .wr_wid     (execute_if_in.data.wid),
-        .wr_mexp_a  (wr_mexp_a_w),
-        .wr_mexp_b  (wr_mexp_b_w),
+        .wr_meta_a  (wr_meta_a_w),
+        .wr_meta_b  (wr_meta_b_w),
         // Read combinationally by current wid
         .rd_wid     (execute_if_in.data.wid),
-        .rd_mexp_a  (rd_mexp_a),
-        .rd_mexp_b  (rd_mexp_b)
+        .rd_meta_a  (rd_meta_a),
+        .rd_meta_b  (rd_meta_b)
     );
 
     // -------------------------------------------------------------------------
@@ -183,36 +198,71 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire ldscale_hazard = is_nop_in && (wmma_inflight[execute_if_in.data.wid] != '0);
 
     // -------------------------------------------------------------------------
-    // INT8 flatten with saturation (INT path WMMA only)
-    //   flat = saturate_int8(int8_val << mexp)
-    //   For mexp=0: no change (passthrough).
-    //   For mexp=1: left-shift by 1 with INT8 saturation.
-    //     overflow_pos: int8_val[7]=0, int8_val[6]=1  → clamp to +127
-    //     overflow_neg: int8_val[7]=1, int8_val[6]=0  → clamp to -128
+    // INT8 flatten with saturation (INT path WMMA / FLAT)
+    //   flat = saturate_int8(int8_val << effective_shift)
+    //   effective_shift = decode_meta(meta_entry, fmt_s)
+    //   For shift=0: passthrough. For META_BITS=1 (default): bit-identical to Phase A/10.
+    //
+    // Overflow detection (general N-bit shift):
+    //   Sign-extend int8_in to FLAT_W = 8+MAX_SHIFT bits, left-shift by shift.
+    //   Bits [FLAT_W-1:7] must all be equal (all-0 or all-1); otherwise saturate.
+    //   Saturation uses the original sign of int8_in (not the shifted result).
     // -------------------------------------------------------------------------
+    localparam MAX_SHIFT = (1 << META_BITS) - 1;  // maximum effective shift (conservative)
+    localparam FLAT_W    = 8 + MAX_SHIFT;          // working width; default(META_BITS=1): 9
+
     function automatic logic [7:0] flatten_int8_byte(
-        input logic [7:0] int8_in,
-        input logic       mexp
+        input logic [7:0]            int8_in,
+        input logic [META_BITS-1:0]  shift   // effective shift: value = int8 × 2^shift
     );
-        logic overflow_pos, overflow_neg;
-        if (!mexp) return int8_in;                         // mexp=0: passthrough
-        overflow_pos = (int8_in[7] == 1'b0) && (int8_in[6] == 1'b1);  // +overflow
-        overflow_neg = (int8_in[7] == 1'b1) && (int8_in[6] == 1'b0);  // -overflow
-        if (overflow_pos) return 8'h7F;
-        if (overflow_neg) return 8'h80;
-        return {int8_in[6:0], 1'b0};  // << 1
+        logic [FLAT_W-1:0]  wide;
+        logic [FLAT_W-1:0]  shifted;
+        logic [MAX_SHIFT:0] upper;      // bits [FLAT_W-1:7] of shifted
+        logic               no_overflow;
+        if (shift == '0) return int8_in;                         // shift=0: passthrough
+        wide    = {{MAX_SHIFT{int8_in[7]}}, int8_in};            // sign-extend
+        shifted = wide << shift;                                 // logical left shift
+        upper   = shifted[FLAT_W-1:7];                          // sign-check region
+        no_overflow = (&upper) | (~|upper);                      // all-same → fits INT8
+        if (!no_overflow) return int8_in[7] ? 8'h80 : 8'h7F;    // saturate by original sign
+        return shifted[7:0];
     endfunction
 
-    // Flatten a 32-bit word (4 INT8 bytes, 2 pairs)
-    //   mexp[0]: pair0 (bytes 0,1), mexp[1]: pair1 (bytes 2,3)
-    function automatic logic [31:0] flatten_int8_word(
-        input logic [31:0] word,
-        input logic [1:0]  mexp
+    // fmt_s 기반 metadata 해석 → effective shift 반환
+    // 현재(Phase C): passthrough (META_BITS=1, MX9만 존재 → shift = meta 전체)
+    // 미래 3-level 포맷 추가 시 이 함수에 case 한 줄만 추가
+    function automatic logic [META_BITS-1:0] decode_meta(
+        input logic [META_BITS-1:0] meta,
+        /* verilator lint_off UNUSED */
+        input logic [3:0]           fmt_s
+        /* verilator lint_on UNUSED */
     );
-        return {flatten_int8_byte(word[31:24], mexp[1]),
-                flatten_int8_byte(word[23:16], mexp[1]),
-                flatten_int8_byte(word[15:8],  mexp[0]),
-                flatten_int8_byte(word[7:0],   mexp[0])};
+        // fmt_s retained for future 3-level format support.
+        // Future: case (fmt_s) TCU_3LEVEL_ID: return meta[...] + meta[...]; endcase
+        return meta;
+    endfunction
+
+    // Flatten a word (N_BYTES × INT8) using per-group metadata
+    //   meta  : CTX_W bits = N_CTX × META_BITS (LSB-first, ctx[0] at bits[META_BITS-1:0])
+    //   fmt_s : used by decode_meta() for format-specific interpretation
+    //
+    // 2D packed array casting: meta_arr[i] = meta[i*META_BITS +: META_BITS]
+    // byte b → ctx_index = b >> LOG2_GROUP_SIZE (wire routing after loop unroll)
+    // Default (META_BITS=1, LOG2_GROUP_SIZE=1): bit-identical to Phase A/10.
+    function automatic logic [N_BYTES*8-1:0] flatten_int8_word(
+        input logic [N_BYTES*8-1:0]  word,
+        input logic [CTX_W-1:0]      meta,
+        input logic [3:0]            fmt_s
+    );
+        logic [N_BYTES*8-1:0]             result;
+        logic [N_CTX-1:0][META_BITS-1:0]  meta_arr;
+        meta_arr = meta;  // 1D → 2D 캐스팅: meta_arr[i] = meta[i*META_BITS +: META_BITS]
+        for (integer b = 0; b < N_BYTES; b++) begin
+            logic [META_BITS-1:0] eff_shift;
+            eff_shift = decode_meta(meta_arr[b >> LOG2_GROUP_SIZE], fmt_s);
+            result[b*8 +: 8] = flatten_int8_byte(word[b*8 +: 8], eff_shift);
+        end
+        return result;
     endfunction
 
     // INT WMMA trigger (fmt_s[3]=1, tcu_op=WMMA, not nop)
@@ -258,20 +308,36 @@ module VX_tcu_operand_transformer import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             // MX9 INT WMMA: flatten INT8 using micro_ctx, patch fmt_s → I8
             for (integer t = 0; t < `NUM_THREADS; t++) begin
                 ot_data_next.rs1_data[t] = flatten_int8_word(
-                    execute_if_in.data.rs1_data[t], rd_mexp_a[t]);
+                    execute_if_in.data.rs1_data[t], rd_meta_a[t],
+                    execute_if_in.data.op_args.tcu.fmt_s);
                 ot_data_next.rs2_data[t] = flatten_int8_word(
-                    execute_if_in.data.rs2_data[t], rd_mexp_b[t]);
+                    execute_if_in.data.rs2_data[t], rd_meta_b[t],
+                    execute_if_in.data.op_args.tcu.fmt_s);
             end
             // Patch: fmt_s → TCU_I8_ID so pe_switch routes to INT path
             ot_data_next.op_args.tcu.fmt_s = 4'(TCU_I8_ID);
         end else if (do_flatten_int) begin
-            // Plain INT8 WMMA: apply micro_ctx flatten (mexp=0 = passthrough if no LDMICRO)
+            // Plain INT8 WMMA: apply micro_ctx flatten (meta=0 = passthrough if no LDMICRO)
             for (integer t = 0; t < `NUM_THREADS; t++) begin
                 ot_data_next.rs1_data[t] = flatten_int8_word(
-                    execute_if_in.data.rs1_data[t], rd_mexp_a[t]);
+                    execute_if_in.data.rs1_data[t], rd_meta_a[t],
+                    execute_if_in.data.op_args.tcu.fmt_s);
                 ot_data_next.rs2_data[t] = flatten_int8_word(
-                    execute_if_in.data.rs2_data[t], rd_mexp_b[t]);
+                    execute_if_in.data.rs2_data[t], rd_meta_b[t],
+                    execute_if_in.data.op_args.tcu.fmt_s);
             end
+        end
+        else if (is_flat_in) begin
+            // FLAT: apply metadata flatten to rs1_data, route to INT path
+            // tile_type[0]=0 → A tile (use rd_meta_a), tile_type[0]=1 → B tile (use rd_meta_b)
+            for (integer t = 0; t < `NUM_THREADS; t++) begin
+                ot_data_next.rs1_data[t] = flatten_int8_word(
+                    execute_if_in.data.rs1_data[t],
+                    execute_if_in.data.op_args.tcu.tile_type[0] ? rd_meta_b[t] : rd_meta_a[t],
+                    execute_if_in.data.op_args.tcu.fmt_s);
+            end
+            // Route to INT path (pe_switch uses fmt_s[3]=1)
+            ot_data_next.op_args.tcu.fmt_s = 4'(TCU_I8_ID);
         end
         // FP WMMA (BF16/FP16/FP32): passthrough (exp_total already patched above)
     end

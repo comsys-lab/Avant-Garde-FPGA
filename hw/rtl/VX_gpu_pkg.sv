@@ -532,12 +532,14 @@ package VX_gpu_pkg;
 
 `ifdef EXT_TCU_ENABLE
 `ifdef EXT_AG_TCU_ENABLE
-    // AG-TCU: WMMA vs scale-load vs tile-load operation selector (2-bit)
-    // tcu_op=00 → WMMA; tcu_op=01 → LDSCALE; tcu_op=10 → LDTILE
-    typedef enum logic [1:0] {
-        TCU_OP_WMMA    = 2'b00,
-        TCU_OP_LDSCALE = 2'b01,
-        TCU_OP_LDTILE  = 2'b10
+    // AG-TCU: WMMA vs scale-load vs tile-load vs micro-exp-load vs flatten operation selector (3-bit)
+    // tcu_op=000 → WMMA; 001 → LDSCALE; 010 → LDTILE; 011 → LDMICRO; 100 → FLAT
+    typedef enum logic [2:0] {
+        TCU_OP_WMMA    = 3'b000,
+        TCU_OP_LDSCALE = 3'b001,
+        TCU_OP_LDTILE  = 3'b010,
+        TCU_OP_LDMICRO = 3'b011,
+        TCU_OP_FLAT    = 3'b100
     } tcu_op_e;
 `endif
 
@@ -549,9 +551,9 @@ package VX_gpu_pkg;
         // tile_type (2-bit): 0=TILE_A, 1=TILE_B, 2=TILE_C.
         // exp_total (10-bit signed): OT pipeline output, [-254, +256].
         //   Set by VX_tcu_operand_xformer (Phase 7). TCU_EXP_TOTAL=10 (VX_tcu_pkg).
-        logic [(INST_ARGS_BITS-30)-1:0]  __padding;
+        logic [(INST_ARGS_BITS-31)-1:0]  __padding;
         logic signed [9:0]               exp_total;  // E8M0: scale_a + scale_b - 254
-        tcu_op_e                         tcu_op;     // 2'b00=WMMA, 2'b01=LDSCALE, 2'b10=LDTILE
+        tcu_op_e                         tcu_op;     // 3'b000=WMMA, 3'b001=LDSCALE, 3'b010=LDTILE, 3'b011=LDMICRO
         logic [1:0]                      tile_type;  // TILE_A=0, TILE_B=1, TILE_C=2
     `else
         logic [(INST_ARGS_BITS-16)-1:0] __padding;

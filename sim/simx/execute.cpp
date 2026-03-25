@@ -30,6 +30,9 @@
 #include "processor_impl.h"
 #endif
 #include "VX_types.h"
+#ifdef EXT_TCU_ENABLE
+#include "tensor_cfg.h"
+#endif
 
 using namespace vortex;
 
@@ -1458,9 +1461,66 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
         trace->data = trace_data;
         assert(warp.tmask.count() == num_threads);
+#ifdef EXT_AG_TCU_ENABLE
+        if (tpuArgs.tcu_op == 0) { // TCU_OP_WMMA
+          tensor_unit_->ag_wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        } else {
+          tensor_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        }
+#else
         tensor_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+#endif
         rd_write = true;
       } break;
+#ifdef EXT_AG_TCU_ENABLE
+      case TcuType::LDSCALE: {
+        // LDSCALE: write scale context — no register writeback
+        tensor_unit_->ldscale(wid, rs1_data);
+        // rd_write stays false (LDSCALE has no output)
+      } break;
+      case TcuType::LDTILE: {
+        // LDTILE: load packed INT8 tile data from memory → tile registers
+        // rs1_data[t] = thread t's base address; each thread loads n_words words
+        // Tile registers are written directly to warp.freg_file (no rd_write path)
+        namespace vt = vortex::tensor;
+        using ldtile_cfg = vt::wmma_config_t<NUM_THREADS>;
+        constexpr uint32_t ra_base = 0;
+        constexpr uint32_t rb_base = (ldtile_cfg::NRB == 4) ? 28 : 10;
+        constexpr uint32_t rc_base = (ldtile_cfg::NRB == 4) ? 10 : 24;
+        uint32_t tile_type = tpuArgs.tile_type;
+        uint32_t reg_base, n_words;
+        switch (tile_type) {
+        case 0: reg_base = ra_base; n_words = ldtile_cfg::NRA; break; // TILE_A
+        case 1: reg_base = rb_base; n_words = ldtile_cfg::NRB; break; // TILE_B
+        case 2: reg_base = rc_base; n_words = ldtile_cfg::NRC; break; // TILE_C
+        default: std::abort();
+        }
+        DPH(2, "LDTILE: tile_type=" << tile_type << ", reg_base=" << reg_base
+            << ", n_words=" << n_words << std::endl);
+        for (uint32_t t = 0; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          uint64_t base_addr = rs1_data[t].u;
+          for (uint32_t w = 0; w < n_words; ++w) {
+            uint64_t read_data = 0;
+            this->dcache_read(&read_data, base_addr + w * 4, 4);
+            warp.freg_file.at(reg_base + w).at(t) = nan_box((uint32_t)read_data);
+          }
+        }
+        // rd_write stays false (tile registers written directly above)
+      } break;
+      case TcuType::LDMICRO: {
+        // LDMICRO: write per-warp micro_exp context — no register writeback
+        tensor_unit_->ldmicro(wid, rs1_data, rs2_data);
+        // rd_write stays false
+      } break;
+      case TcuType::FLAT: {
+        // FLAT: apply micro_exp flatten to one tile register in-place (writeback to rd)
+        uint32_t tile_type = tpuArgs.tile_type;
+        tensor_unit_->ldflat(wid, tile_type, num_threads, rs1_data, rd_data);
+        rd_write = true;
+      } break;
+#endif
       default:
         std::abort();
       }

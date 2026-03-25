@@ -14,7 +14,9 @@
 `include "VX_define.vh"
 
 module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
-    parameter `STRING INSTANCE_ID = ""
+    parameter `STRING INSTANCE_ID = "",
+    parameter META_BITS        = 1,  // metadata bits per ctx entry (Phase C); default=1
+    parameter LOG2_GROUP_SIZE  = 1   // log2 of group size (Phase C); default=1 → pair-shared
 ) (
     `SCOPE_IO_DECL
 
@@ -50,7 +52,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `elsif TCU_DPI
     localparam PIPE_LATENCY_FP = 2 + 2 + 1;  // FMUL(2)+FACC(2)+mdata(1)
 `elsif TCU_BHF
-    localparam PIPE_LATENCY_FP = (2+1) + 1 + $clog2(2*TCU_TC_K+1)*(2+1) + (2+1) + 1;
+    localparam PIPE_LATENCY_FP = (2+1) + 1 + $clog2(2*TCU_TC_K+1)*(2+1) + 1;
+    // (FMUL+FRND=3) + conv(1) + FACC(=$clog2(2k+1)×3, absorbs final FADD via +1 trick) + mdata(1)
+    // = VX_tcu_fp.sv PIPE_LATENCY = FEDP_LATENCY(13) + 1 = 14  (for TCU_TC_K=2)
 `else
     localparam PIPE_LATENCY_FP = 5;  // fallback
 `endif
@@ -104,7 +108,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         wire [NW_WIDTH-1:0] ot_result_wid;
 
         VX_tcu_operand_transformer #(
-            .PIPE_LATENCY_INT (6)  // VX_tcu_int internal: FEDP(5)+mdata(1)
+            .PIPE_LATENCY_INT (6),             // VX_tcu_int internal: FEDP(5)+mdata(1)
+            .META_BITS        (META_BITS),
+            .LOG2_GROUP_SIZE  (LOG2_GROUP_SIZE)
         ) operand_xformer (
             .clk            (clk),
             .reset          (reset),
@@ -115,12 +121,13 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .result_wid     (ot_result_wid)
         );
 
-        // LDSCALE/LDTILE/LDMICRO always → INT path (pe_sel=1); evaluated on OT output.
-        // Note: MX9 WMMA fmt_s is patched to I8_ID (bit3=1) by OT → also routes to INT.
+        // LDSCALE/LDTILE/LDMICRO/FLAT always → INT path (pe_sel=1); evaluated on OT output.
+        // Note: MX9 WMMA and FLAT fmt_s is patched to I8_ID (bit3=1) by OT → also routes to INT.
         wire pe_sel_w = ot_execute_if.data.op_args.tcu.fmt_s[3]
                       | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDSCALE)
                       | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDTILE)
-                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDMICRO);
+                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_LDMICRO)
+                      | (ot_execute_if.data.op_args.tcu.tcu_op == TCU_OP_FLAT);
 
         VX_pe_switch #(
             .PE_COUNT    (PE_COUNT),

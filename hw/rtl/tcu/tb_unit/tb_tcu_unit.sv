@@ -6,12 +6,20 @@
 //   INT8 MAC → INT32 dot → FP32(×2^exp_total) + FP32 C accumulation.
 //
 // Tests:
-//   TC1:             INT8 WMMA basic regression (exp_total=0 → FP32 8.0)
-//   TC_hazard:       LDSCALE hazard lock (FP32 expected values)
-//   TC_MX9_mexp0:    MX9 WMMA, mexp=0 (identity flatten) → FP32 8.0
-//   TC_MX9_mexp_a1:  MX9 WMMA, mexp_a=1 (A×2), mexp_b=0 → FP32 16.0
-//   TC_MX9_sat_pos:  MX9 WMMA, A=0x40 (+64), mexp=1 → saturate +127 → FP32 1016.0
-//   TC_MX9_sat_neg:  MX9 WMMA, A=0x80 (-128), mexp=1 → saturate -128 → FP32 -1024.0
+//   TC1:                INT8 WMMA basic regression (exp_total=0 → FP32 8.0)
+//   TC_hazard:          LDSCALE hazard lock (FP32 expected values)
+//   TC_MX9_mexp0:       MX9 WMMA, mexp=0 (identity flatten) → FP32 8.0
+//   TC_MX9_mexp_a1:     MX9 WMMA, mexp_a=1 (A×2), mexp_b=0 → FP32 16.0
+//   TC_MX9_sat_pos:     MX9 WMMA, A=0x40 (+64), mexp=1 → saturate +127 → FP32 1016.0
+//   TC_MX9_sat_neg:     MX9 WMMA, A=0x80 (-128), mexp=1 → saturate -128 → FP32 -1024.0
+//   TC_FLAT_identity:   FLAT, mexp=0 → passthrough
+//   TC_FLAT_a_double:   FLAT A-tile, mexp_a=2'b11 → ×2
+//   TC_FLAT_b_double:   FLAT B-tile, mexp_b=2'b11 → ×2
+//   TC_FLAT_mixed_pairs: FLAT A-tile, pair1_mexp=1/pair0_mexp=0 → mixed shift
+//   TC_FLAT_sat_pos:    FLAT A-tile, +64 + mexp=1 → overflow_pos → +127
+//   TC_FLAT_sat_neg:    FLAT A-tile, -128 + mexp=1 → overflow_neg → -128
+//   TC_FLAT_iso_a_notb: FLAT B-tile with mexp_a=11/mexp_b=00 → passthrough (isolation)
+//   TC_FLAT_neg_no_sat: FLAT A-tile, INT8=-2 + mexp=1 → -4 (normal neg shift)
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -319,6 +327,66 @@ module tb_tcu_unit;
     endtask
 `endif // EXT_AG_TCU_ENABLE
 
+`ifdef EXT_AG_TCU_ENABLE
+    // =========================================================================
+    // fire_flat: issue one FLAT UOP for a single tile register and wait for commit
+    //   tile_type: 0=A tile (uses mexp_a from micro_ctx), 1=B tile (uses mexp_b)
+    //   rs1_input: tile register content for all threads (uniform)
+    //   result: rd_data (flattened, all threads)
+    // =========================================================================
+    task automatic fire_flat(
+        input logic        tile_type,
+        input logic [31:0] rs1_word,   // uniform word for all threads
+        output commit_t    res
+    );
+        dispatch_t pkt;
+        pkt = '0;
+        pkt.uuid = UUID_WIDTH'(2); pkt.wis = '0; pkt.sid = '0;
+        pkt.tmask = '1; pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.rd = NUM_REGS_BITS'(tile_type ? TCU_RB : TCU_RA);
+        pkt.op_type = INST_ALU_BITS'(INST_TCU_WMMA);
+        for (int t = 0; t < `SIMD_WIDTH; t++)
+            pkt.rs1_data[t] = rs1_word;
+        pkt.op_args.tcu.fmt_s     = 4'(TCU_I8_ID);
+        pkt.op_args.tcu.fmt_d     = 4'(TCU_I32_ID);
+        pkt.op_args.tcu.tcu_op    = TCU_OP_FLAT;
+        pkt.op_args.tcu.tile_type = {1'b0, tile_type};
+        fire_dispatch(pkt);
+        wait_commit(res);
+    endtask
+
+    // =========================================================================
+    // run_test_flat: LDMICRO → FLAT one register → check output
+    // =========================================================================
+    task automatic run_test_flat(
+        input string       name,
+        input logic [1:0]  mexp_a, mexp_b,
+        input logic        tile_type,   // 0=A tile, 1=B tile
+        input logic [31:0] rs1_word,    // tile register content (uniform)
+        input logic [31:0] exp_word     // expected flattened word
+    );
+        commit_t res;
+        fire_ldmicro(mexp_a, mexp_b);
+        fire_flat(tile_type, rs1_word, res);
+
+        begin
+            bit ok;
+            ok = 1;
+            for (int t = 0; t < TCU_TC_M * TCU_TC_N; t++) begin
+                if (res.data[t] !== exp_word) begin
+                    $display("[FAIL] %-28s thread %0d: got=0x%08X exp=0x%08X",
+                             name, t, res.data[t], exp_word);
+                    ok = 0;
+                end
+            end
+            if (ok) begin
+                $display("[PASS] %-28s output=0x%08X", name, exp_word);
+                pass_cnt++;
+            end else fail_cnt++;
+        end
+    endtask
+`endif // EXT_AG_TCU_ENABLE
+
     // =========================================================================
     // Stimulus
     // =========================================================================
@@ -462,6 +530,60 @@ module tb_tcu_unit;
             fill(32'h80808080), fill(32'h01010101), fill(32'h00000000),
             8'd127, 8'd127, 2'b11, 2'b00,
             32'hC4800000);  // -1024.0
+
+        // ====================================================================
+        // FLAT instruction tests (Phase B)
+        //   FLAT applies micro_exp flatten in-place to one tile register.
+        //   Uses the same flatten_int8_word as WMMA INT path.
+        //
+        // TC_FLAT_identity: mexp=0 → passthrough
+        //   input=0x01020304, mexp_a=0 → flat=0x01020304
+        //
+        // TC_FLAT_a_double: A-tile, mexp_a=2'b11 (both pairs shift 1)
+        //   input=0x01010101, flat=0x02020202
+        //
+        // TC_FLAT_b_double: B-tile, mexp_b=2'b11, mexp_a=0
+        //   input=0x01010101, flat=0x02020202
+        //
+        // TC_FLAT_mixed_pairs: A-tile, mexp_a=2'b10 (pair1=1, pair0=0)
+        //   input=0x01020304 → pair0(bytes 0,1): no shift → 0x0304
+        //                       pair1(bytes 2,3): ×2 → 0x0204
+        //   flat=0x02040304
+        //
+        // TC_FLAT_sat_pos: A-tile, mexp_a=2'b11, input=0x40404040 (INT8=+64)
+        //   +64 << 1 = +128 > +127 → saturate → 0x7F, flat=0x7F7F7F7F
+        //
+        // TC_FLAT_sat_neg: A-tile, mexp_a=2'b11, input=0x80808080 (INT8=-128)
+        //   -128 << 1 = -256 < -128 → saturate → 0x80, flat=0x80808080
+        // ====================================================================
+        run_test_flat("TC_FLAT_identity",
+            2'b00, 2'b00, 1'b0, 32'h01020304, 32'h01020304);
+
+        run_test_flat("TC_FLAT_a_double",
+            2'b11, 2'b00, 1'b0, 32'h01010101, 32'h02020202);
+
+        run_test_flat("TC_FLAT_b_double",
+            2'b00, 2'b11, 1'b1, 32'h01010101, 32'h02020202);
+
+        run_test_flat("TC_FLAT_mixed_pairs",
+            2'b10, 2'b00, 1'b0, 32'h01020304, 32'h02040304);
+
+        run_test_flat("TC_FLAT_sat_pos",
+            2'b11, 2'b00, 1'b0, 32'h40404040, 32'h7F7F7F7F);
+
+        run_test_flat("TC_FLAT_sat_neg",
+            2'b11, 2'b00, 1'b0, 32'h80808080, 32'h80808080);
+
+        // TC_FLAT_iso_a_notb: mexp_a=2'b11이지만 B-tile FLAT → mexp_b=2'b00이므로 passthrough
+        //   mexp_a 오염 여부 검증: tile_type=1이면 mexp_b만 참조해야 함
+        run_test_flat("TC_FLAT_iso_a_notb",
+            2'b11, 2'b00, 1'b1, 32'h01020304, 32'h01020304);
+
+        // TC_FLAT_neg_no_sat: 음수 shift, overflow 없는 정상 경로
+        //   INT8=-2 (0xFE=11111110), mexp=1 → -2<<1 = -4 (0xFC=11111100), 포화 없음
+        //   bit7=1, bit6=1 → {b[6:0], 1'b0} = {1111110, 0} = 0xFC
+        run_test_flat("TC_FLAT_neg_no_sat",
+            2'b11, 2'b00, 1'b0, 32'hFEFEFEFE, 32'hFCFCFCFC);
 
 `endif // EXT_AG_TCU_ENABLE
 

@@ -6,15 +6,19 @@
 // Phase 10: INT path FEDP outputs FP32 (INT8 MAC → FP32 via exp_total scale).
 //
 // Test cases:
-//   TC_int_k_accum   — INT8 path K-accumulation regression (FP32 output)
-//   TC_MX9_mexp0     — MX9 WMMA, mexp=0 (identity) → same result as INT8
-//   TC_MX9_mexp_a1   — MX9 WMMA, mexp_a=1 (A×2 before MAC)
-//   TC_int_exp_pos2  — exp_total=+2 (scale_a=128, scale_b=128): fp32_exp_scale +2
-//   TC_int_exp_neg1  — exp_total=-1 (scale_a=127, scale_b=126): fp32_exp_scale -1
-//   TC_MX9_mexp_mixed — pair1_mexp=1, pair0_mexp=0: pair-indexed flatten
-//   TC_nonzero_C     — C=-8.0 starting accumulator: fp32_add with mixed sign
-//   TC_neg_A         — A=0xFF (INT8=-1): negative dot product → neg FP32 output
-//   TC_MX9_sat_pos   — A=0x40+mexp=1 → saturation 0x7F (overflow_pos path)
+//   TC_int_k_accum      — INT8 path K-accumulation regression (FP32 output)
+//   TC_MX9_mexp0        — MX9 WMMA, mexp=0 (identity) → same result as INT8
+//   TC_MX9_mexp_a1      — MX9 WMMA, mexp_a=1 (A×2 before MAC)
+//   TC_int_exp_pos2     — exp_total=+2 (scale_a=128, scale_b=128): fp32_exp_scale +2
+//   TC_int_exp_neg1     — exp_total=-1 (scale_a=127, scale_b=126): fp32_exp_scale -1
+//   TC_MX9_mexp_mixed   — pair1_mexp=1, pair0_mexp=0: pair-indexed flatten
+//   TC_nonzero_C        — C=-8.0 starting accumulator: fp32_add with mixed sign
+//   TC_neg_A            — A=0xFF (INT8=-1): negative dot product → neg FP32 output
+//   TC_MX9_sat_pos      — A=0x40+mexp=1 → saturation 0x7F (overflow_pos path)
+//   TC_FLAT_full_ident  — FLAT full sequence, mexp=0 → passthrough (regression)
+//   TC_FLAT_full_double — FLAT A-tile ×2 + B-tile passthrough (isolation check)
+//   TC_FLAT_full_mixed  — FLAT A-tile pair-mixed shift (pair1≠pair0)
+//   TC_FLAT_then_WMMA   — FLAT output → WMMA input (pipeline integration)
 //
 // Safe (serial) mode: fire one uop → wait commit → update D_mat → next uop.
 // =============================================================================
@@ -436,6 +440,78 @@ module tb_tcu_wmma;
     endtask
 `endif // EXT_AG_TCU_ENABLE
 
+`ifdef EXT_AG_TCU_ENABLE
+    // =========================================================================
+    // fire_flat_uop: send one FLAT UOP and wait for commit
+    //   tile_type: 0=A tile (uses mexp_a from micro_ctx), 1=B tile (uses mexp_b)
+    //   rs1_word: uniform tile register content for all threads
+    // =========================================================================
+    task automatic fire_flat_uop(
+        input logic        tile_type,
+        input logic [31:0] rs1_word,
+        output commit_t    res
+    );
+        dispatch_t pkt;
+        pkt = '0;
+        pkt.uuid = UUID_WIDTH'(2); pkt.wis = '0; pkt.sid = '0;
+        pkt.tmask = '1; pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.op_type = INST_ALU_BITS'(INST_TCU_WMMA);
+        for (int t = 0; t < `SIMD_WIDTH; t++)
+            pkt.rs1_data[t] = rs1_word;
+        pkt.op_args.tcu.fmt_s     = 4'(TCU_I8_ID);
+        pkt.op_args.tcu.fmt_d     = 4'(TCU_I32_ID);
+        pkt.op_args.tcu.tcu_op    = TCU_OP_FLAT;
+        pkt.op_args.tcu.tile_type = {1'b0, tile_type};
+        fire_dispatch(pkt);
+        wait_commit(res);
+    endtask
+
+    // =========================================================================
+    // run_wmma_flat: LDMICRO → TCU_FLAT_UOPS FLAT UOPs → verify all commits
+    //   Sends NRA A-tile UOPs (tile_type=0) then NRB B-tile UOPs (tile_type=1).
+    //   Each UOP verifies all TCU_TC_M×TCU_TC_N output slots match exp_*_flat.
+    // =========================================================================
+    task automatic run_wmma_flat(
+        input string       name,
+        input logic [1:0]  mexp_a, mexp_b,
+        input logic [31:0] a_word,      // uniform input for each A-tile register
+        input logic [31:0] b_word,      // uniform input for each B-tile register
+        input logic [31:0] exp_a_flat,  // expected flattened output for A-tile
+        input logic [31:0] exp_b_flat   // expected flattened output for B-tile
+    );
+        commit_t res;
+        bit test_pass;
+        test_pass = 1;
+
+        fire_ldmicro(mexp_a, mexp_b);
+
+        for (int ctr = 0; ctr < TCU_FLAT_UOPS; ctr++) begin
+            logic        tile_type;
+            logic [31:0] rs1_word, exp_word;
+            tile_type = (ctr >= TCU_NRA) ? 1'b1 : 1'b0;
+            rs1_word  = tile_type ? b_word : a_word;
+            exp_word  = tile_type ? exp_b_flat : exp_a_flat;
+
+            fire_flat_uop(tile_type, rs1_word, res);
+
+            for (int t = 0; t < TCU_TC_M * TCU_TC_N; t++) begin
+                if (res.data[t] !== exp_word) begin
+                    $display("[FAIL] %-28s ctr=%0d t=%0d got=0x%08X exp=0x%08X",
+                             name, ctr, t, res.data[t], exp_word);
+                    test_pass = 0;
+                end
+            end
+        end
+
+        if (test_pass) begin
+            $display("[PASS] %-28s all %0d UOPs (%0d A + %0d B) correct",
+                     name, TCU_FLAT_UOPS, TCU_NRA, TCU_NRB);
+            pass_cnt++;
+        end else
+            fail_cnt++;
+    endtask
+`endif // EXT_AG_TCU_ENABLE
+
     // =========================================================================
     // Stimulus
     // =========================================================================
@@ -565,6 +641,59 @@ module tb_tcu_wmma;
         // --------------------------------------------------------------------
         fill_A(32'h40404040); fill_B(32'h01010101); fill_D(32'h00000000);
         run_wmma_mx9("TC_MX9_sat_pos", 8'd127, 8'd127, 2'b11, 2'b00);
+
+        // --------------------------------------------------------------------
+        // FLAT instruction tests (Phase B)
+        //   run_wmma_flat: LDMICRO → NRA A-tile UOPs + NRB B-tile UOPs
+        //   Verifies full FLAT sequence including A/B tile isolation.
+        // --------------------------------------------------------------------
+
+        // TC_FLAT_full_ident: mexp=0 → all passthrough (regression)
+        //   A=0x01020304, B=0x05060708 → no change
+        run_wmma_flat("TC_FLAT_full_ident",
+            2'b00, 2'b00,
+            32'h01020304, 32'h05060708,
+            32'h01020304, 32'h05060708);
+
+        // TC_FLAT_full_double: mexp_a=11 → A×2, mexp_b=00 → B passthrough
+        //   Verifies A-tile flatten AND isolation (mexp_a not applied to B-tile)
+        //   A=0x01010101 → 0x02020202; B=0x01010101 → 0x01010101
+        run_wmma_flat("TC_FLAT_full_double",
+            2'b11, 2'b00,
+            32'h01010101, 32'h01010101,
+            32'h02020202, 32'h01010101);
+
+        // TC_FLAT_full_mixed: mexp_a=2'b10 (pair1=1, pair0=0)
+        //   pair0 bytes (0,1): no shift → unchanged
+        //   pair1 bytes (2,3): ×2
+        //   A=0x01020304 → pair0(0x04,0x03)→0x04,0x03; pair1(0x02,0x01)→0x04,0x02
+        //   flat_a = 0x02040304
+        run_wmma_flat("TC_FLAT_full_mixed",
+            2'b10, 2'b00,
+            32'h01020304, 32'h01020304,
+            32'h02040304, 32'h01020304);
+
+        // TC_FLAT_then_WMMA: use FLAT output as WMMA input (integration)
+        //   Step 1: FLAT A-tile (mexp_a=11, 0x01→0x02) — capture flattened data
+        //   Step 2: reset micro_ctx (mexp=00) so WMMA INT path doesn't re-flatten
+        //   Step 3: INT8 WMMA with captured A=0x02020202, B=0x01010101, D=0
+        //   Expected: dot per k-step = TC_K×4 × 2×1 = 16 → FP32 16.0/k-step
+        //     NT=4: K_STEPS=2 → 32.0 = 0x42000000
+        //     NT=8: K_STEPS=4 → 64.0 = 0x42800000
+        begin : tc_flat_then_wmma
+            logic [31:0] captured_a;
+            commit_t flat_res;
+            fire_ldmicro(2'b11, 2'b00);
+            for (int i = 0; i < TCU_FLAT_UOPS; i++) begin
+                logic tile_type_l;
+                tile_type_l = (i >= TCU_NRA) ? 1'b1 : 1'b0;
+                fire_flat_uop(tile_type_l, 32'h01010101, flat_res);
+                if (i == 0) captured_a = flat_res.data[0];  // expect 0x02020202
+            end
+            fire_ldmicro(2'b00, 2'b00);  // reset micro_ctx → WMMA passthrough
+            fill_A(captured_a); fill_B(32'h01010101); fill_D(32'h00000000);
+            run_wmma("TC_FLAT_then_WMMA", 8'd127, 8'd127);
+        end
 `endif
 
         $display("------------------------------------------------------------");

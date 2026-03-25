@@ -52,4 +52,20 @@ inline constexpr uint32_t L3_NUM_REQS     = NUM_CLUSTERS * L2_MEM_PORTS;
 inline constexpr uint32_t PER_ISSUE_WARPS = NUM_WARPS / ISSUE_WIDTH;
 inline constexpr uint32_t ISSUE_WIS_BITS  = log2ceil(PER_ISSUE_WARPS);
 
+#ifdef EXT_AG_TCU_ENABLE
+// AG-TCU: Scale Context Register (per-warp, 2-port)
+// Matches VX_tcu_pkg.sv: TCU_EXP_BITS=8, TCU_EXP_BIAS=127, TCU_EXP_TOTAL=10
+// Phase 5: E8M0 format — scale_a/scale_b are unsigned 8-bit [0,255]; bias=127.
+//   exp_total = scale_a + scale_b - 2*bias; range [-254, +256], clamped to [-31, +30].
+inline constexpr uint32_t AG_TCU_EXP_BITS  = 8;    // bits per side (unsigned E8M0: 0..255)
+inline constexpr uint32_t AG_TCU_EXP_BIAS  = 127;  // E8M0 bias (neutral: scale=127 → exp_total=0)
+inline constexpr uint32_t AG_TCU_EXP_TOTAL = 10;   // signed sum width (covers [-254, +256])
+inline constexpr int32_t  AG_TCU_EXP_MAX   = 30;   // left shift clamp (early saturation)
+inline constexpr int32_t  AG_TCU_EXP_MIN   = -31;  // right shift flush-to-zero bound
+
+// Tile / TC dimensions are NUM_THREADS-dependent; derived in tensor_unit.cpp via wmma_config_t.
+// Shift: exp_total >= 0 → left shift; exp_total < 0 → arithmetic right shift.
+// Clamp: exp_total > AG_TCU_EXP_MAX → early saturation; exp_total < AG_TCU_EXP_MIN → flush to 0.
+#endif
+
 } // namespace vortex

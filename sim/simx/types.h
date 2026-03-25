@@ -641,6 +641,12 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
 
 enum class TcuType {
   WMMA,
+#ifdef EXT_AG_TCU_ENABLE
+  LDSCALE,  // Load Scale Context: rs1[0][7:0]=scale_a, [15:8]=scale_b (E8M0)
+  LDTILE,   // Load Tile Data: reads packed INT8 from memory into tile registers
+  LDMICRO,  // Load Micro-exp Context: rs1[t][1:0]=mexp_a{pair1,pair0}, rs2[t][1:0]=mexp_b (Phase 10)
+  FLAT,     // Flatten tile registers in-place: apply micro_exp to A/B tile INT8 data (Phase B)
+#endif
 };
 
 struct IntrTcuArgs {
@@ -648,11 +654,21 @@ struct IntrTcuArgs {
   uint32_t fmt_d  : 4;
   uint32_t step_m : 4;
   uint32_t step_n : 4;
+#ifdef EXT_AG_TCU_ENABLE
+  uint32_t tcu_op        : 4;  // 0=WMMA, 1=LDSCALE, 2=LDTILE, 3=LDMICRO, 4=FLAT (matches TCU_OP_* in VX_tcu_pkg.sv)
+  uint32_t tile_type     : 4;  // 0=TILE_A, 1=TILE_B, 2=TILE_C
+#endif
 };
 
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
   case TcuType::WMMA: os << "WMMA"; break;
+#ifdef EXT_AG_TCU_ENABLE
+  case TcuType::LDSCALE:  os << "LDSCALE";  break;
+  case TcuType::LDTILE:   os << "LDTILE";   break;
+  case TcuType::LDMICRO:  os << "LDMICRO";  break;
+  case TcuType::FLAT:     os << "FLAT";     break;
+#endif
   default:
     assert(false);
   }
