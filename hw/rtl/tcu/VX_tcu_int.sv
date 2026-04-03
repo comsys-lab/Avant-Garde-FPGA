@@ -156,18 +156,24 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             wire [`XLEN-1:0] c_val_r;
 
 `ifdef EXT_AG_TCU_ENABLE
-            // Phase 7: exp_total read directly from execute_if.data.op_args.tcu.exp_total
-            // (set by VX_tcu_operand_transformer upstream).
-            // Operands already zero-gated by OT for LDSCALE/LDTILE — no is_nop_xf needed.
-            wire signed [TCU_EXP_TOTAL-1:0] exp_total_r;
+            // Phase D: buffer per-(i,j) scale slices; compute exp_total_r after the register.
+            wire [TCU_EXP_BITS-1:0] scale_A_ij = execute_if.data.op_args.tcu.scale_A[i*TCU_EXP_BITS +: TCU_EXP_BITS];
+            wire [TCU_EXP_BITS-1:0] scale_B_ij = execute_if.data.op_args.tcu.scale_B[j*TCU_EXP_BITS +: TCU_EXP_BITS];
+            wire [TCU_EXP_BITS-1:0] scale_A_ij_r, scale_B_ij_r;
 
             `BUFFER_EX (
-                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r,    exp_total_r},
-                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0], execute_if.data.op_args.tcu.exp_total},
-                fedp_enable,
-                0, // resetw
+                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r,    scale_A_ij_r,  scale_B_ij_r},
+                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0], scale_A_ij,    scale_B_ij},
+                fedp_enable && execute_if.valid, // idle X 캡처 방지
+                $bits({a_row_r, b_col_r, c_val_r, fmt_s_r, fmt_d_r, scale_A_ij_r, scale_B_ij_r}),
                 1  // depth
             );
+
+            // Per-(i,j) signed exp_total: E8M0 sum minus 2×bias
+            wire signed [TCU_EXP_TOTAL-1:0] exp_total_r =
+                $signed(TCU_EXP_TOTAL'({2'b0, scale_A_ij_r}))
+              + $signed(TCU_EXP_TOTAL'({2'b0, scale_B_ij_r}))
+              - $signed(TCU_EXP_TOTAL'(2 * TCU_EXP_BIAS));
 
             VX_tcu_fedp_int_scaled #(
                 .LATENCY   (FEDP_LATENCY),
@@ -191,8 +197,8 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             `BUFFER_EX (
                 {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r},
                 {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0]},
-                fedp_enable,
-                0, // resetw
+                fedp_enable && execute_if.valid, // idle X 캡처 방지
+                $bits({a_row_r, b_col_r, c_val_r, fmt_s_r, fmt_d_r}),
                 1  // depth
             );
 
@@ -259,12 +265,30 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
     end
 `endif
+`ifdef EXT_AG_TCU_ENABLE
+    logic [`SIMD_WIDTH-1:0][`XLEN-1:0] packed_d_val;
+    generate
+        for (genvar a = 0; a < TCU_TC_M; a++) begin
+            for (genvar b = 0; b < TCU_TC_N; b++) begin
+                assign packed_d_val[a * TCU_TC_N + b] = d_val[a][b];
+            end
+        end
+    endgenerate
 
     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
-`ifdef EXT_AG_TCU_ENABLE
-    assign result_if.data.data  = is_flat_pipe[0] ? flat_data_pipe[0] : {>>{d_val}};
+    assign result_if.data.data  = is_flat_pipe[0] ? flat_data_pipe[0] : packed_d_val;
 `else
-    assign result_if.data.data  = d_val;
+    logic [`SIMD_WIDTH-1:0][`XLEN-1:0] packed_d_val;
+    generate
+        for (genvar a = 0; a < TCU_TC_M; a++) begin
+            for (genvar b = 0; b < TCU_TC_N; b++) begin
+                assign packed_d_val[a * TCU_TC_N + b] = d_val[a][b];
+            end
+        end
+    endgenerate
+
+    assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
+    assign result_if.data.data  = packed_d_val;
 `endif
     assign result_if.data.pid = 0;
     assign result_if.data.sop = 1;

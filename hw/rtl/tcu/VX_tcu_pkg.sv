@@ -39,14 +39,26 @@ package VX_tcu_pkg;
     localparam TCU_FP32_ID = 0;
     localparam TCU_FP16_ID = 1;
     localparam TCU_BF16_ID = 2;
-    localparam TCU_MX9_ID  = 4;  // MX9: INT8 2's comp, micro_exp via LDMICRO; OT flattens+patches fmt_s→I8_ID (INT path)
-    localparam TCU_FP8E4M3_ID  = 5;  // FP8: E4M3 (4-bit unsigned exp with bias=7, 3-bit unsigned mantissa); micro_exp via LDMICRO; OT flattens+patches fmt_s→I8_ID (INT path)
-    localparam TCU_FP8E5M2_ID  = 6;  // FP8: E5M2 (5-bit unsigned exp with bias=15, 2-bit unsigned mantissa); micro_exp via LDMICRO; OT flattens+patches fmt_s→I8_ID (INT path)    
-    localparam TCU_I32_ID  = 8;
-    localparam TCU_I8_ID   = 9;
-    localparam TCU_U8_ID   = 10;
-    localparam TCU_I4_ID   = 11;
-    localparam TCU_U4_ID   = 12;
+    // MX9: E8M0 + 1b micro_exp (per pair) + 8b normalized significand {s[1b],frac[6:0]}
+    //   element = (-1)^s × (1 + frac/128) × 2^(micro_exp) × 2^(block_exp - bias)
+    //   OT Option C: Q=128+frac, flat=Q>>(2-mexp) → INT8 [32..63] or [64..127]
+    //     fmt_s patched to I8_ID; exp_total_adjusted = exp_total_base - 10
+    localparam TCU_MX9_ID      = 4;
+    localparam TCU_FP8E4M3_ID  = 5;  // FP8 E4M3 (bias=7, no Infinity); fmt_s[3]=0 → FP path; FEDP: FP8→BF16 then BHF MAC
+    localparam TCU_FP8E5M2_ID  = 6;  // FP8 E5M2 (bias=15, has Infinity); fmt_s[3]=0 → FP path; FEDP: FP8→BF16 then BHF MAC
+    // 3LEVEL: hypothetical 3-level hierarchical scale (L1=E8M0 global, L2=word-level, L3=pair-level)
+    //   OT pre-computes combined shift (L2+L3) per pair from micro_ctx, then flattens INT8 mantissas.
+    //   fmt_s[3]=0 → OT patches to I8_ID → INT path.  LDMICRO encodes 2-bit combined shifts.
+    localparam TCU_3LEVEL_ID   = 3;
+    localparam TCU_I32_ID      = 8;
+    localparam TCU_I8_ID       = 9;
+    localparam TCU_U8_ID       = 10;
+    localparam TCU_I4_ID       = 11;
+    localparam TCU_U4_ID       = 12;
+    // MXINT8: E8M0 shared_exp + Signed INT8 (no micro_exp)
+    //   element = INT8 × 2^(block_exp - bias)
+    //   fmt_s[3]=1 → INT path 직접 라우팅 (OT fmt_s 패치 불필요)
+    localparam TCU_MXINT8_ID   = 13;
 
     // Tile dimensions
     localparam TCU_TILE_CAP = TCU_NT * TCU_NR;
@@ -101,7 +113,11 @@ package VX_tcu_pkg;
             TCU_FP32_ID: `TRACE(level, ("fp32"))
             TCU_FP16_ID: `TRACE(level, ("fp16"))
             TCU_BF16_ID: `TRACE(level, ("bf16"))
-            TCU_MX9_ID:  `TRACE(level, ("mx9"))
+            TCU_MX9_ID:      `TRACE(level, ("mx9"))
+            TCU_3LEVEL_ID:   `TRACE(level, ("3level"))
+            TCU_MXINT8_ID:   `TRACE(level, ("mxint8"))
+            TCU_FP8E4M3_ID:  `TRACE(level, ("fp8e4m3"))
+            TCU_FP8E5M2_ID:  `TRACE(level, ("fp8e5m2"))
             TCU_I32_ID:  `TRACE(level, ("i32"))
             TCU_I8_ID:   `TRACE(level, ("i8"))
             TCU_U8_ID:   `TRACE(level, ("u8"))

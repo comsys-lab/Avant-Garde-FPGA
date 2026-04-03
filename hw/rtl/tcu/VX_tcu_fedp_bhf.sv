@@ -121,11 +121,126 @@ module VX_tcu_fedp_bhf #(
             `UNUSED_PIN(fflags)
         );
 
+        // -----------------------------------------------------------------------
+        // FP8 native multiply (Phase C): FP8×FP8 → FP32 recoded, no BHF fmul.
+        // Packing: FP8 byte resides at [15:8] of each 16-bit half-word.
+        //   a_row16[2*k]   = a_row[k][15:0]  → FP8[0] = [15:8]
+        //   a_row16[2*k+1] = a_row[k][31:16] → FP8[1] = [15:8] of this slice
+        // Math:
+        //   prod_m = {1,m_a} × {1,m_b}  (integer multiply of implicit-1 mantissas)
+        //   FP32_exp = e_a + e_b + bias_adj + prod_m[MSB]
+        //   FP32_man = prod_m[MSB] ? {prod_m[MSB-1:0], pad} : {prod_m[MSB-2:0], pad}
+        //   Pipeline: combinational compute → DEPTH(FMT_DELAY) register → fNToRecFN
+        // -----------------------------------------------------------------------
+
+        wire [7:0] fp8_byte_a = a_row16[i][15:8];
+        wire [7:0] fp8_byte_b = b_col16[i][15:8];
+
+        // --- FP8 E4M3 × E4M3 → FP32 ---
+        // Encoding: s[7] e[6:3] m[2:0], bias=7, no Inf (e=0xF,m=0 is sat.max)
+        wire        e4m3_sa     = fp8_byte_a[7];
+        wire [3:0]  e4m3_ea     = fp8_byte_a[6:3];
+        wire [2:0]  e4m3_ma     = fp8_byte_a[2:0];
+        wire        e4m3_sb     = fp8_byte_b[7];
+        wire [3:0]  e4m3_eb     = fp8_byte_b[6:3];
+        wire [2:0]  e4m3_mb     = fp8_byte_b[2:0];
+
+        wire e4m3_a_zero   = (e4m3_ea == 4'h0) & (e4m3_ma == 3'h0);
+        wire e4m3_b_zero   = (e4m3_eb == 4'h0) & (e4m3_mb == 3'h0);
+        wire e4m3_a_nan    = (e4m3_ea == 4'hF) & (e4m3_ma != 3'h0);
+        wire e4m3_b_nan    = (e4m3_eb == 4'hF) & (e4m3_mb != 3'h0);
+        wire e4m3_a_denorm = (e4m3_ea == 4'h0) & (e4m3_ma != 3'h0); // flush-to-zero
+        wire e4m3_b_denorm = (e4m3_eb == 4'h0) & (e4m3_mb != 3'h0);
+
+        wire [3:0]  e4m3_maf  = {1'b1, e4m3_ma};   // implicit-1 mantissa
+        wire [3:0]  e4m3_mbf  = {1'b1, e4m3_mb};
+        wire [7:0]  e4m3_pm   = 8'(e4m3_maf) * 8'(e4m3_mbf);  // 4b×4b→8b ∈ [64,225]
+        // FP32 exp: e_a+e_b - 2×bias(7) + FP32_bias(127) + norm_bit = e_a+e_b+113+norm
+        wire [8:0]  e4m3_fexp = {5'b0, e4m3_ea} + {5'b0, e4m3_eb} + 9'd113
+                                + {8'b0, e4m3_pm[7]};
+        wire [22:0] e4m3_fman = e4m3_pm[7] ? {e4m3_pm[6:0], 16'b0}
+                                            : {e4m3_pm[5:0], 17'b0};
+        wire e4m3_sr = e4m3_sa ^ e4m3_sb;
+
+        logic [31:0] e4m3_fp32;
+        always_comb begin
+            if (e4m3_a_zero | e4m3_b_zero | e4m3_a_denorm | e4m3_b_denorm)
+                e4m3_fp32 = {e4m3_sr, 31'h0};      // ±0
+            else if (e4m3_a_nan | e4m3_b_nan)
+                e4m3_fp32 = 32'h7FC00000;           // canonical qNaN
+            else
+                e4m3_fp32 = {e4m3_sr, e4m3_fexp[7:0], e4m3_fman};
+        end
+
+        wire [31:0] e4m3_fp32_d;
+        VX_pipe_register #(.DATAW(32), .DEPTH(FMT_DELAY)) pipe_e4m3 (
+            .clk(clk), .reset(reset), .enable(enable),
+            .data_in(e4m3_fp32), .data_out(e4m3_fp32_d)
+        );
+
+        wire [32:0] mult_result_fp8e4m3;
+        fNToRecFN #(.expWidth(8), .sigWidth(24)) e4m3_to_rec (
+            .in(e4m3_fp32_d), .out(mult_result_fp8e4m3)
+        );
+
+        // --- FP8 E5M2 × E5M2 → FP32 ---
+        // Encoding: s[7] e[6:2] m[1:0], bias=15, has Inf (e=0x1F,m=0)
+        wire        e5m2_sa     = fp8_byte_a[7];
+        wire [4:0]  e5m2_ea     = fp8_byte_a[6:2];
+        wire [1:0]  e5m2_ma     = fp8_byte_a[1:0];
+        wire        e5m2_sb     = fp8_byte_b[7];
+        wire [4:0]  e5m2_eb     = fp8_byte_b[6:2];
+        wire [1:0]  e5m2_mb     = fp8_byte_b[1:0];
+
+        wire e5m2_a_zero   = (e5m2_ea == 5'h00) & (e5m2_ma == 2'h0);
+        wire e5m2_b_zero   = (e5m2_eb == 5'h00) & (e5m2_mb == 2'h0);
+        wire e5m2_a_inf    = (e5m2_ea == 5'h1F) & (e5m2_ma == 2'h0);
+        wire e5m2_b_inf    = (e5m2_eb == 5'h1F) & (e5m2_mb == 2'h0);
+        wire e5m2_a_nan    = (e5m2_ea == 5'h1F) & (e5m2_ma != 2'h0);
+        wire e5m2_b_nan    = (e5m2_eb == 5'h1F) & (e5m2_mb != 2'h0);
+        wire e5m2_a_denorm = (e5m2_ea == 5'h00) & (e5m2_ma != 2'h0); // flush-to-zero
+        wire e5m2_b_denorm = (e5m2_eb == 5'h00) & (e5m2_mb != 2'h0);
+
+        wire [2:0]  e5m2_maf  = {1'b1, e5m2_ma};   // implicit-1 mantissa
+        wire [2:0]  e5m2_mbf  = {1'b1, e5m2_mb};
+        wire [5:0]  e5m2_pm   = 6'(e5m2_maf) * 6'(e5m2_mbf);  // 3b×3b→6b ∈ [16,49]
+        // FP32 exp: e_a+e_b - 2×bias(15) + FP32_bias(127) + norm_bit = e_a+e_b+97+norm
+        wire [8:0]  e5m2_fexp = {4'b0, e5m2_ea} + {4'b0, e5m2_eb} + 9'd97
+                                + {8'b0, e5m2_pm[5]};
+        wire [22:0] e5m2_fman = e5m2_pm[5] ? {e5m2_pm[4:0], 18'b0}
+                                            : {e5m2_pm[3:0], 19'b0};
+        wire e5m2_sr = e5m2_sa ^ e5m2_sb;
+
+        logic [31:0] e5m2_fp32;
+        always_comb begin
+            if (e5m2_a_zero | e5m2_b_zero | e5m2_a_denorm | e5m2_b_denorm)
+                e5m2_fp32 = {e5m2_sr, 31'h0};
+            else if (e5m2_a_nan | e5m2_b_nan)
+                e5m2_fp32 = 32'h7FC00000;           // canonical qNaN
+            else if (e5m2_a_inf | e5m2_b_inf)
+                e5m2_fp32 = {e5m2_sr, 8'hFF, 23'h0};   // ±Inf
+            else
+                e5m2_fp32 = {e5m2_sr, e5m2_fexp[7:0], e5m2_fman};
+        end
+
+        wire [31:0] e5m2_fp32_d;
+        VX_pipe_register #(.DATAW(32), .DEPTH(FMT_DELAY)) pipe_e5m2 (
+            .clk(clk), .reset(reset), .enable(enable),
+            .data_in(e5m2_fp32), .data_out(e5m2_fp32_d)
+        );
+
+        wire [32:0] mult_result_fp8e5m2;
+        fNToRecFN #(.expWidth(8), .sigWidth(24)) e5m2_to_rec (
+            .in(e5m2_fp32_d), .out(mult_result_fp8e5m2)
+        );
+
         logic [32:0] mult_result_mux;
         always_comb begin
             case(fmt_s_delayed)
                 3'd1: mult_result_mux = mult_result_fp16;
                 3'd2: mult_result_mux = mult_result_bf16;
+                3'd5: mult_result_mux = mult_result_fp8e4m3; // TCU_FP8E4M3_ID
+                3'd6: mult_result_mux = mult_result_fp8e5m2; // TCU_FP8E5M2_ID
                 default: mult_result_mux = 'x;
             endcase
         end

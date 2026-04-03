@@ -75,8 +75,9 @@ module VX_tcu_fedp_int_scaled #(
     // ---------------------------------------------------------------------------
     wire [2:0] delayed_fmt_s;
     VX_pipe_register #(
-        .DATAW (3),
-        .DEPTH (MUL_LATENCY - 1)
+        .DATAW  (3),
+        .RESETW (3),
+        .DEPTH  (MUL_LATENCY - 1)
     ) pipe_fmt_s (
         .clk      (clk),
         .reset    (reset),
@@ -92,8 +93,9 @@ module VX_tcu_fedp_int_scaled #(
     // ---------------------------------------------------------------------------
     wire signed [EXP_TOTAL-1:0] delayed_exp;
     VX_pipe_register #(
-        .DATAW (EXP_TOTAL),
-        .DEPTH (MUL_LATENCY + RED_LATENCY)
+        .DATAW  (EXP_TOTAL),
+        .RESETW (EXP_TOTAL),
+        .DEPTH  (MUL_LATENCY + RED_LATENCY)
     ) pipe_exp (
         .clk      (clk),
         .reset    (reset),
@@ -108,8 +110,9 @@ module VX_tcu_fedp_int_scaled #(
     // ---------------------------------------------------------------------------
     wire [31:0] delayed_c;
     VX_pipe_register #(
-        .DATAW (32),
-        .DEPTH (MUL_LATENCY + RED_LATENCY + SCALE_LATENCY)
+        .DATAW  (32),
+        .RESETW (32),
+        .DEPTH  (MUL_LATENCY + RED_LATENCY + SCALE_LATENCY)
     ) pipe_c (
         .clk      (clk),
         .reset    (reset),
@@ -130,7 +133,10 @@ module VX_tcu_fedp_int_scaled #(
         reg [9:0]  prod_u4_1a, prod_u4_1b;
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_i8_1a <= '0;
+                prod_i8_1b <= '0;
+            end else if (enable) begin
                 prod_i8_1a <= ($signed(a_row[i][7:0])   * $signed(b_col[i][7:0]))
                             + ($signed(a_row[i][15:8])  * $signed(b_col[i][15:8]));
                 prod_i8_1b <= ($signed(a_row[i][23:16]) * $signed(b_col[i][23:16]))
@@ -139,7 +145,10 @@ module VX_tcu_fedp_int_scaled #(
         end
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_u8_1a <= '0;
+                prod_u8_1b <= '0;
+            end else if (enable) begin
                 prod_u8_1a <= (a_row[i][7:0]   * b_col[i][7:0])
                             + (a_row[i][15:8]  * b_col[i][15:8]);
                 prod_u8_1b <= (a_row[i][23:16] * b_col[i][23:16])
@@ -148,7 +157,10 @@ module VX_tcu_fedp_int_scaled #(
         end
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_i4_1a <= '0;
+                prod_i4_1b <= '0;
+            end else if (enable) begin
                 prod_i4_1a <= (($signed(a_row[i][3:0])   * $signed(b_col[i][3:0]))
                              + ($signed(a_row[i][7:4])   * $signed(b_col[i][7:4])))
                             + (($signed(a_row[i][11:8])  * $signed(b_col[i][11:8]))
@@ -161,7 +173,10 @@ module VX_tcu_fedp_int_scaled #(
         end
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_u4_1a <= '0;
+                prod_u4_1b <= '0;
+            end else if (enable) begin
                 prod_u4_1a <= ((a_row[i][3:0]   * b_col[i][3:0])
                              + (a_row[i][7:4]   * b_col[i][7:4]))
                             + ((a_row[i][11:8]  * b_col[i][11:8])
@@ -181,11 +196,12 @@ module VX_tcu_fedp_int_scaled #(
         reg [PSELW-1:0] mult_sel;
         always @(*) begin
             case (delayed_fmt_s)
-            3'd1: mult_sel = PSELW'($signed(sum_i8));
-            3'd2: mult_sel = PSELW'(sum_u8);
-            3'd3: mult_sel = PSELW'($signed(sum_i4));
-            3'd4: mult_sel = PSELW'(sum_u4);
-            default: mult_sel = 'x;
+            3'd1: mult_sel = PSELW'($signed(sum_i8));  // I8_ID=9,      fmt_s[2:0]=001
+            3'd2: mult_sel = PSELW'(sum_u8);           // U8_ID=10,     fmt_s[2:0]=010
+            3'd3: mult_sel = PSELW'($signed(sum_i4));  // I4_ID=11,     fmt_s[2:0]=011
+            3'd4: mult_sel = PSELW'(sum_u4);           // U4_ID=12,     fmt_s[2:0]=100
+            3'd5: mult_sel = PSELW'($signed(sum_i8));  // MXINT8_ID=13, fmt_s[2:0]=101 → signed INT8
+            default: mult_sel = '0;  // reset 기간 X 전파 방지 (정상 동작 시 미도달)
             endcase
         end
 

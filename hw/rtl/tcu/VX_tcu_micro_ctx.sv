@@ -11,36 +11,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// VX_tcu_micro_ctx — Phase 10: per-warp micro-exponent context register.
-//                   Phase A: MEXP_BITS parameterization (default=1, bit-identical to Phase 10).
-//                   Phase C: MEXP_BITS→META_BITS; LOG2_GROUP_SIZE parameterization.
+// VX_tcu_micro_ctx — per-warp micro-scale context register file.
 //
-// Stores per-group metadata bits for INT8 tiles (A and B).
+// Stores per-group scale factor bits for INT8 tiles (A and B).
 // Written by LDMICRO instructions, read combinationally by VX_tcu_operand_transformer.
 //
 // Parameterization:
-//   META_BITS       : bits per ctx entry (format-agnostic)
-//   LOG2_GROUP_SIZE : log2 of how many bytes share one ctx entry
-//                     default=1 → GROUP_SIZE=2 (pair-shared, MX9 current behavior)
+//   SCALE_BITS       : bits per scale factor entry
+//   LOG2_SCALE_GROUP : log2 of how many bytes share one scale entry
+//                      default=1 → GROUP_SIZE=2 (pair-shared, MX9 behavior)
 //
 // Per word (XLEN=32 → N_BYTES=4):
-//   N_CTX = N_BYTES >> LOG2_GROUP_SIZE  ctx entries per word
-//   CTX_W = N_CTX * META_BITS           total bits per thread
+//   N_CTX = N_BYTES >> LOG2_SCALE_GROUP  scale entries per word
+//   CTX_W = N_CTX * SCALE_BITS           total bits per thread
 //
 // LDMICRO payload (CTX_W bits per thread):
 //   rs1_data[t][CTX_W-1:0] = {ctx[N_CTX-1], ..., ctx[1], ctx[0]}  (A tile, LSB-first)
 //   rs2_data[t][CTX_W-1:0] = same layout (B tile)
-//
-// Default (META_BITS=1, LOG2_GROUP_SIZE=1): CTX_W=2, bit-identical to Phase A/10.
 
 `include "VX_define.vh"
 
 `ifdef EXT_AG_TCU_ENABLE
 
 module VX_tcu_micro_ctx import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
-    parameter NUM_WARPS       = `NUM_WARPS,
-    parameter META_BITS       = 1,  // bits per ctx entry (format-agnostic)
-    parameter LOG2_GROUP_SIZE = 1   // default=1 → GROUP_SIZE=2 (pair-shared, MX9 behavior)
+    parameter  NUM_WARPS       = `NUM_WARPS,
+    parameter  SCALE_BITS      = 1,  // bits per scale factor entry
+    parameter  LOG2_SCALE_GROUP = 1,  // default=1 → GROUP_SIZE=2 (pair-shared, MX9 behavior)
+    // Derived: must be localparam in #() so they are in scope for port declarations.
+    // Vivado xvlog requires identifiers used in ports to be declared before the port list;
+    // localparams in the parameter port list satisfy this requirement (IEEE 1800-2017 §23.10).
+    localparam N_BYTES = `XLEN / 8,                      // = 4 for XLEN=32
+    localparam N_CTX   = N_BYTES >> LOG2_SCALE_GROUP,    // default=1 → 2
+    localparam CTX_W   = N_CTX * SCALE_BITS              // default → 2 bits
 ) (
     input wire clk,
     input wire reset,
@@ -48,19 +50,16 @@ module VX_tcu_micro_ctx import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Write port — driven by LDMICRO execute_fire (input side of OT)
     input wire                                             wr_valid,
     input wire [NW_WIDTH-1:0]                              wr_wid,
-    input wire [`NUM_THREADS-1:0][N_CTX*META_BITS-1:0]    wr_meta_a,  // N_CTX entries for A
-    input wire [`NUM_THREADS-1:0][N_CTX*META_BITS-1:0]    wr_meta_b,  // N_CTX entries for B
+    input wire [`NUM_THREADS-1:0][CTX_W-1:0]              wr_meta_a,
+    input wire [`NUM_THREADS-1:0][CTX_W-1:0]              wr_meta_b,
 
     // Read port — combinational, indexed by warp ID of incoming WMMA/FLAT
     input wire [NW_WIDTH-1:0]                              rd_wid,
-    output wire [`NUM_THREADS-1:0][N_CTX*META_BITS-1:0]   rd_meta_a,  // N_CTX entries for A
-    output wire [`NUM_THREADS-1:0][N_CTX*META_BITS-1:0]   rd_meta_b   // N_CTX entries for B
+    output wire [`NUM_THREADS-1:0][CTX_W-1:0]             rd_meta_a,
+    output wire [`NUM_THREADS-1:0][CTX_W-1:0]             rd_meta_b
 );
-    localparam N_BYTES = `XLEN / 8;                    // = 4 for XLEN=32
-    localparam N_CTX   = N_BYTES >> LOG2_GROUP_SIZE;   // default=1 → 2
-    localparam CTX_W   = N_CTX * META_BITS;            // default → 2 bits (Phase A identical)
 
-    // Storage: [warp][thread] CTX_W bits (N_CTX entries of META_BITS each)
+    // Storage: [warp][thread] CTX_W bits (N_CTX entries of SCALE_BITS each)
     reg [CTX_W-1:0] meta_a_r [NUM_WARPS][`NUM_THREADS];
     reg [CTX_W-1:0] meta_b_r [NUM_WARPS][`NUM_THREADS];
 
@@ -80,9 +79,12 @@ module VX_tcu_micro_ctx import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
     end
 
+    // Safe read: clamp rd_wid to avoid X-index on Vivado xsim when input is invalid.
+    wire [NW_WIDTH-1:0] safe_rd_wid = (rd_wid < NUM_WARPS) ? rd_wid : '0;
+
     for (genvar t = 0; t < `NUM_THREADS; t++) begin : g_rd
-        assign rd_meta_a[t] = meta_a_r[rd_wid][t];
-        assign rd_meta_b[t] = meta_b_r[rd_wid][t];
+        assign rd_meta_a[t] = meta_a_r[safe_rd_wid][t];
+        assign rd_meta_b[t] = meta_b_r[safe_rd_wid][t];
     end
 
 endmodule

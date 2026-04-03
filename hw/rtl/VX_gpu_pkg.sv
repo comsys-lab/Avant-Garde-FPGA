@@ -490,9 +490,17 @@ package VX_gpu_pkg;
 
     //////////////////////// instruction arguments ////////////////////////////
 
+`ifdef EXT_AG_TCU_ENABLE
+    // Phase D: scale_A[2×8b] + scale_B[2×8b] = 32b replaces __padding(6)+exp_total(10)=16b → +16b net
+    localparam INST_ARGS_BITS = ALU_TYPE_BITS + `XLEN + 3 + 16;  // 37 + 16 = 53
+`else
     localparam INST_ARGS_BITS = ALU_TYPE_BITS + `XLEN + 3;
+`endif
 
     typedef struct packed {
+`ifdef EXT_AG_TCU_ENABLE
+        logic [15:0] __tcu_scale_pad;  // Phase D: 16b pad to match extended INST_ARGS_BITS
+`endif
         logic use_PC;
         logic use_imm;
         logic is_w;
@@ -546,15 +554,15 @@ package VX_gpu_pkg;
     typedef struct packed {
     `ifdef EXT_AG_TCU_ENABLE
         // AG-TCU: Avant-Garde flatten architecture.
-        // Scale context written by LDSCALE; tile data loaded via FLW (HW-transparent).
-        // tcu_op (2-bit) selects WMMA / LDSCALE / LDTILE.
-        // tile_type (2-bit): 0=TILE_A, 1=TILE_B, 2=TILE_C.
-        // exp_total (10-bit signed): OT pipeline output, [-254, +256].
-        //   Set by VX_tcu_operand_xformer (Phase 7). TCU_EXP_TOTAL=10 (VX_tcu_pkg).
-        logic [(INST_ARGS_BITS-31)-1:0]  __padding;
-        logic signed [9:0]               exp_total;  // E8M0: scale_a + scale_b - 254
-        tcu_op_e                         tcu_op;     // 3'b000=WMMA, 3'b001=LDSCALE, 3'b010=LDTILE, 3'b011=LDMICRO
-        logic [1:0]                      tile_type;  // TILE_A=0, TILE_B=1, TILE_C=2
+        // Phase D: per-row/col E8M0 scale vectors carried in instruction payload.
+        //   scale_A[i] (8b): row-i exponent for A matrix (written by LDSCALE, stored in OT).
+        //   scale_B[j] (8b): col-j exponent for B matrix.
+        //   exp_total[i][j] = scale_A[i] + scale_B[j] - 254, computed per (i,j) inside FEDP.
+        //   [i*8+:8] = scale_A[i]; [j*8+:8] = scale_B[j]; TC_M=TC_N=2 → each 16b.
+        logic [15:0]  scale_A;   // scale_A[1:0] packed, E8M0 unsigned 8b each (TC_M=2)
+        logic [15:0]  scale_B;   // scale_B[1:0] packed, E8M0 unsigned 8b each (TC_N=2)
+        tcu_op_e      tcu_op;    // 3'b000=WMMA, 3'b001=LDSCALE, 3'b010=LDTILE, 3'b011=LDMICRO, 3'b100=FLAT
+        logic [1:0]   tile_type; // TILE_A=0, TILE_B=1, TILE_C=2
     `else
         logic [(INST_ARGS_BITS-16)-1:0] __padding;
     `endif

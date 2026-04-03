@@ -1,7 +1,7 @@
 ROOT_DIR := $(realpath ..)
 include $(ROOT_DIR)/config.mk
 
-all: stub rtlsim simx opae xrt
+all: stub rtlsim simx xrt
 
 vm: stub simx
 

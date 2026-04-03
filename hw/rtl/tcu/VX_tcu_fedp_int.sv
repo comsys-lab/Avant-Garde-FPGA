@@ -64,7 +64,10 @@ module VX_tcu_fedp_int #(
         reg [9:0] prod_u4_1a, prod_u4_1b;
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_i8_1a <= '0;
+                prod_i8_1b <= '0;
+            end else if (enable) begin
                 prod_i8_1a <= ($signed(a_row[i][7:0]) * $signed(b_col[i][7:0]))
                             + ($signed(a_row[i][15:8]) * $signed(b_col[i][15:8]));
                 prod_i8_1b <= ($signed(a_row[i][23:16]) * $signed(b_col[i][23:16]))
@@ -73,7 +76,10 @@ module VX_tcu_fedp_int #(
         end
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_u8_1a <= '0;
+                prod_u8_1b <= '0;
+            end else if (enable) begin
                 prod_u8_1a <= (a_row[i][7:0] * b_col[i][7:0])
                             + (a_row[i][15:8] * b_col[i][15:8]);
                 prod_u8_1b <= (a_row[i][23:16] * b_col[i][23:16])
@@ -82,7 +88,10 @@ module VX_tcu_fedp_int #(
         end
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_i4_1a <= '0;
+                prod_i4_1b <= '0;
+            end else if (enable) begin
                 prod_i4_1a <= (($signed(a_row[i][3:0]) * $signed(b_col[i][3:0])) + ($signed(a_row[i][7:4]) * $signed(b_col[i][7:4])))
                             + (($signed(a_row[i][11:8]) * $signed(b_col[i][11:8])) + ($signed(a_row[i][15:12]) * $signed(b_col[i][15:12])));
                 prod_i4_1b <= (($signed(a_row[i][19:16]) * $signed(b_col[i][19:16])) + ($signed(a_row[i][23:20]) * $signed(b_col[i][23:20])))
@@ -91,7 +100,10 @@ module VX_tcu_fedp_int #(
         end
 
         always @(posedge clk) begin
-            if (enable) begin
+            if (reset) begin
+                prod_u4_1a <= '0;
+                prod_u4_1b <= '0;
+            end else if (enable) begin
                 prod_u4_1a <= ((a_row[i][3:0] * b_col[i][3:0]) + (a_row[i][7:4] * b_col[i][7:4]))
                             + ((a_row[i][11:8] * b_col[i][11:8]) + (a_row[i][15:12] * b_col[i][15:12]));
                 prod_u4_1b <= ((a_row[i][19:16] * b_col[i][19:16]) + (a_row[i][23:20] * b_col[i][23:20]))
@@ -111,7 +123,7 @@ module VX_tcu_fedp_int #(
             3'd2: mult_sel = PSELW'(sum_u8);
             3'd3: mult_sel = PSELW'($signed(sum_i4));
             3'd4: mult_sel = PSELW'(sum_u4);
-            default: mult_sel = 'x;
+            default: mult_sel = '0;  // reset 기간 X 전파 방지 (정상 동작 시 미도달)
             endcase
         end
 

@@ -14,7 +14,8 @@
 `include "VX_define.vh"
 
 module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
-    parameter `STRING INSTANCE_ID = ""
+    parameter `STRING INSTANCE_ID = "",
+    parameter HANDLE_SUBNORMAL = 0  // 0: flush-to-zero (default, inference), 1: CLZ normalize
 ) (
     `SCOPE_IO_DECL
 
@@ -63,7 +64,39 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [3:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [3:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
 
-    `UNUSED_VAR ({step_m, step_n, fmt_s, fmt_d, execute_if.data.op_args.tcu.exp_total});
+    `UNUSED_VAR ({step_m, step_n, fmt_d});
+    // fmt_s and scale_A/scale_B are used: [2:0] captured in BUFFER_EX per (i,j).
+
+/* Phase C: FP8 native multiply moved to VX_tcu_fedp_bhf.sv (g_prod).
+   These FP8→BF16 upconversion functions are superseded and retained for reference only.
+
+`ifdef TCU_BHF
+    // FP8 E4M3 → BF16: {s,e[3:0],m[2:0]}, bias=7
+    function automatic logic [15:0] fp8e4m3_to_bf16(input logic [7:0] fp8);
+        logic s; logic [3:0] e; logic [2:0] m;
+        s = fp8[7]; e = fp8[6:3]; m = fp8[2:0];
+        if (e == 4'h0)       return {s, 15'b0};
+        else if (e == 4'hF)  return (m != 3'h0) ? {s, 8'hFF, 7'h40} : {s, 8'hFE, 7'h7F};
+        else                 return {s, e + 8'd120, m, 4'b0};
+    endfunction
+
+    // FP8 E5M2 → BF16: {s,e[4:0],m[1:0]}, bias=15
+    function automatic logic [15:0] fp8e5m2_to_bf16(input logic [7:0] fp8);
+        logic s; logic [4:0] e; logic [1:0] m;
+        s = fp8[7]; e = fp8[6:2]; m = fp8[1:0];
+        if (e == 5'h00)      return {s, 15'b0};
+        else if (e == 5'h1F) return (m == 2'h0) ? {s, 8'hFF, 7'b0} : {s, 8'hFF, 7'h40};
+        else                 return {s, e + 8'd112, m, 5'b0};
+    endfunction
+
+    function automatic logic [31:0] fp8e4m3_to_bf16_word(input logic [31:0] word);
+        return {fp8e4m3_to_bf16(word[31:24]), fp8e4m3_to_bf16(word[15:8])};
+    endfunction
+    function automatic logic [31:0] fp8e5m2_to_bf16_word(input logic [31:0] word);
+        return {fp8e5m2_to_bf16(word[31:24]), fp8e5m2_to_bf16(word[15:8])};
+    endfunction
+`endif // TCU_BHF
+*/
 
     wire [MDATA_WIDTH-1:0] mdata_queue_din, mdata_queue_dout;
     wire mdata_queue_full;
@@ -132,15 +165,24 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             wire [2:0] fmt_s_r, fmt_d_r;
             wire [TCU_TC_K-1:0][`XLEN-1:0] a_row_r, b_col_r;
             wire [`XLEN-1:0] c_val_r;
-            wire [TCU_EXP_TOTAL-1:0] exp_total_r;
+            // Phase D: buffer per-(i,j) scale slices; compute exp_total_r after the register.
+            wire [TCU_EXP_BITS-1:0] scale_A_ij = execute_if.data.op_args.tcu.scale_A[i*TCU_EXP_BITS +: TCU_EXP_BITS];
+            wire [TCU_EXP_BITS-1:0] scale_B_ij = execute_if.data.op_args.tcu.scale_B[j*TCU_EXP_BITS +: TCU_EXP_BITS];
+            wire [TCU_EXP_BITS-1:0] scale_A_ij_r, scale_B_ij_r;
 
             `BUFFER_EX (
-                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r,    exp_total_r},
-                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0], execute_if.data.op_args.tcu.exp_total},
+                {a_row_r, b_col_r, c_val_r, fmt_s_r,    fmt_d_r,    scale_A_ij_r,  scale_B_ij_r},
+                {a_row,   b_col,   c_val,   fmt_s[2:0], fmt_d[2:0], scale_A_ij,    scale_B_ij},
                 fedp_enable,
                 0, // resetw
                 1  // depth
             );
+
+            // Per-(i,j) signed exp_total: E8M0 sum minus 2×bias
+            wire signed [TCU_EXP_TOTAL-1:0] exp_total_r =
+                $signed(TCU_EXP_TOTAL'({2'b0, scale_A_ij_r}))
+              + $signed(TCU_EXP_TOTAL'({2'b0, scale_B_ij_r}))
+              - $signed(TCU_EXP_TOTAL'(2 * TCU_EXP_BIAS));
 
         `ifdef TCU_DPI
             VX_tcu_fedp_dpi #(
@@ -158,6 +200,8 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 .d_val (d_val[i][j])
             );
         `elsif TCU_BHF
+            // Phase C: FP8 native multiply handled inside VX_tcu_fedp_bhf (g_prod).
+            // fmt_s_r passed directly; no FP8→BF16 upconversion needed.
             VX_tcu_fedp_bhf #(
                 .LATENCY     (FEDP_LATENCY),
                 .N           (TCU_TC_K),
@@ -166,7 +210,7 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 .clk      (clk),
                 .reset    (reset),
                 .enable   (fedp_enable),
-                .fmt_s    (fmt_s_r),
+                .fmt_s    (fmt_s_r[2:0]),
                 .fmt_d    (fmt_d_r),
                 .exp_total(exp_total_r),
                 .a_row    (a_row_r),

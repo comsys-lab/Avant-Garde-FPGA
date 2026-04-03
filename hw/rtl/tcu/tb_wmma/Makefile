@@ -139,6 +139,7 @@ VL_FLAGS       += $(VL_FLAGS_EXTRA)
 # Targets
 # --------------------------------------------------------------------------
 .PHONY: all run wave clean nt8
+.PHONY: test-all test-safe test-int8 test-mxint8 test-mx9 test-flat test-fp8 test-mxfp8 test-3level
 
 all: run
 
@@ -157,7 +158,45 @@ wave: $(TARGET)
 clean:
 	rm -rf $(BUILD_DIR) $(VCD_FILE)
 
-# NT=8 target
+# NT=8: all formats, NT=8
 nt8:
 	$(MAKE) clean
 	$(MAKE) run VL_FLAGS_EXTRA="-DNUM_THREADS=8"
+
+# --------------------------------------------------------------------------
+# Per-format test targets
+# Each target rebuilds with the appropriate format define.
+# test-all / test-safe run all formats in one binary (no format define).
+# --------------------------------------------------------------------------
+
+test-all test-safe:
+	$(MAKE) clean
+	$(MAKE) run
+
+test-int8:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_INT8"
+
+test-mxint8:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_MXINT8"
+
+test-mx9:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_MX9"
+
+test-flat:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_FLAT"
+
+test-fp8:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_FP8"
+
+test-mxfp8:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_MXFP8"
+
+test-3level:
+	$(MAKE) clean
+	$(MAKE) run VL_FLAGS_EXTRA="-DTCU_TEST_3LEVEL"

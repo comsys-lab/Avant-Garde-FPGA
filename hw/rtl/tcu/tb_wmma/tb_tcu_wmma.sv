@@ -1,24 +1,33 @@
 // =============================================================================
-// tb_tcu_wmma.sv — VX_tcu_unit full-WMMA K-accumulation testbench
+// tb_tcu_wmma.sv — VX_tcu_unit full-WMMA testbench
 // =============================================================================
-// Level 5: tests VX_tcu_unit with a complete WMMA computation (all UOPS).
+// Level 5: tests VX_tcu_unit with complete WMMA computation (all UOPS).
 //
-// Phase 10: INT path FEDP outputs FP32 (INT8 MAC → FP32 via exp_total scale).
+// Test cases are organized by format in tc/ subdirectory:
+//   tc/int8.svh    — INT8   path: [V2][V3][V4][V5][V7]
+//   tc/mxint8.svh  — MXINT8 path: [V2][V3][V4][V5][V6][V7]
+//   tc/mx9.svh     — MX9    path: [V1][V2][V3][V4][V5][V6][V7][V8]
+//   tc/flat.svh    — FLAT instruction: [V2][V3][V4][V7][V8]
+//   tc/fp8.svh     — FP8 E4M3/E5M2 path: [V2][V3]  (requires TCU_BHF)
 //
-// Test cases:
-//   TC_int_k_accum      — INT8 path K-accumulation regression (FP32 output)
-//   TC_MX9_mexp0        — MX9 WMMA, mexp=0 (identity) → same result as INT8
-//   TC_MX9_mexp_a1      — MX9 WMMA, mexp_a=1 (A×2 before MAC)
-//   TC_int_exp_pos2     — exp_total=+2 (scale_a=128, scale_b=128): fp32_exp_scale +2
-//   TC_int_exp_neg1     — exp_total=-1 (scale_a=127, scale_b=126): fp32_exp_scale -1
-//   TC_MX9_mexp_mixed   — pair1_mexp=1, pair0_mexp=0: pair-indexed flatten
-//   TC_nonzero_C        — C=-8.0 starting accumulator: fp32_add with mixed sign
-//   TC_neg_A            — A=0xFF (INT8=-1): negative dot product → neg FP32 output
-//   TC_MX9_sat_pos      — A=0x40+mexp=1 → saturation 0x7F (overflow_pos path)
-//   TC_FLAT_full_ident  — FLAT full sequence, mexp=0 → passthrough (regression)
-//   TC_FLAT_full_double — FLAT A-tile ×2 + B-tile passthrough (isolation check)
-//   TC_FLAT_full_mixed  — FLAT A-tile pair-mixed shift (pair1≠pair0)
-//   TC_FLAT_then_WMMA   — FLAT output → WMMA input (pipeline integration)
+// Validation axes:
+//   V1 Routing    — OT fmt_s 라우팅 (MX9 implicit; other formats implicit)
+//   V2 Identity   — neutral A,B, C=0 → expected output
+//   V3 Sign       — negative element → negative output
+//   V4 Scale+     — exp_total > 0 (INT path only; N/A for FP8)
+//   V5 Scale-     — exp_total < 0 (INT path only; N/A for FP8)
+//   V6 Boundary   — OT saturation (INT) / special float values (FP8, deferred)
+//   V7 K-Accum    — multi K-step accumulation
+//   V8 Format-spec — format-specific transform (MX9 pair mexp; FP8 subnormal deferred)
+//
+// Build modes:
+//   make test-all    — all formats (default)
+//   make test-int8   — INT8 only
+//   make test-mxint8 — MXINT8 only
+//   make test-mx9    — MX9 only
+//   make test-flat   — FLAT only
+//   make test-fp8    — FP8 only  (requires TCU_BHF)
+//   make nt8         — all formats, NT=8
 //
 // Safe (serial) mode: fire one uop → wait commit → update D_mat → next uop.
 // =============================================================================
@@ -140,6 +149,101 @@ module tb_tcu_wmma;
                 ref_flatten_byte(w[7:0],   mexp[0])};
     endfunction
 
+    // MX9 Option C re-quantization reference
+    //   {s[1b],frac[6:0]} + mexp_bit → INT8 flat = Q>>(2-mexp), Q=128+frac
+    function automatic logic [7:0] ref_mx9_requant_byte(
+        input logic [7:0] byte_val,
+        input logic       mexp_bit
+    );
+        logic [7:0] Q;
+        logic [6:0] flat_mag;
+        Q        = {1'b1, byte_val[6:0]};
+        flat_mag = mexp_bit ? Q[7:1] : Q[7:2];
+        if (byte_val[7] == 1'b0) return {1'b0, flat_mag};
+        else                     return ~{1'b0, flat_mag} + 8'd1;
+    endfunction
+
+    // MX9 dot product with per-pair mexp
+    function automatic logic signed [31:0] ref_dot_mx9(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2,
+        input logic [1:0] mexp_a, mexp_b,
+        input int i, j, b_off
+    );
+        logic signed [31:0] d;
+        logic mexp_a_bit, mexp_b_bit;
+        logic [7:0] a_raw, b_raw;
+        logic signed [7:0] a8, b8;
+        d = '0;
+        for (int k = 0; k < TCU_TC_K; k++)
+            for (int b = 0; b < 4; b++) begin
+                mexp_a_bit = mexp_a[(b >= 2) ? 1 : 0];
+                mexp_b_bit = mexp_b[(b >= 2) ? 1 : 0];
+                a_raw = rs1[i*TCU_TC_K + k][8*b+7 -: 8];
+                b_raw = rs2[b_off + j*TCU_TC_K + k][8*b+7 -: 8];
+                a8 = $signed(ref_mx9_requant_byte(a_raw, mexp_a_bit));
+                b8 = $signed(ref_mx9_requant_byte(b_raw, mexp_b_bit));
+                d += a8 * b8;
+            end
+        return d;
+    endfunction
+
+    // MX9 FP32 reference: dot_mx9 × 2^(exp_total-10) + C
+    function automatic logic [31:0] ref_d_fp32_mx9(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic signed [9:0] exp_total,
+        input logic [1:0] mexp_a, mexp_b,
+        input int i, j, b_off
+    );
+        logic signed [31:0] d;
+        real fp_d, c_r, result_r;
+        d        = ref_dot_mx9(rs1, rs2, mexp_a, mexp_b, i, j, b_off);
+        fp_d     = real'($signed(d)) * ref_pow2(int'($signed(exp_total)) - 10);
+        c_r      = ref_fp32_to_real(rs3[i * TCU_TC_N + j]);
+        result_r = fp_d + c_r;
+        return ref_real_to_fp32(result_r);
+    endfunction
+
+    // 3-level flatten reference: saturate_int8(int8 << shift), shift ∈ {0,1,2}
+    //   Mirrors OT flatten_int8_byte with SCALE_BITS=2 (FLAT_W=11, MAX_SHIFT=3)
+    function automatic logic signed [7:0] ref_3level_flatten_byte(
+        input logic [7:0] b8,
+        input logic [1:0] shift
+    );
+        logic [10:0] wide, shifted;
+        logic [3:0]  upper;
+        if (shift == 2'b00) return signed'(b8);
+        wide    = {{3{b8[7]}}, b8};  // sign-extend to 11 bits (MAX_SHIFT=3 extra bits)
+        shifted = wide << shift;
+        upper   = shifted[10:7];    // bits above INT8 range
+        if ((&upper) | (~|upper)) return signed'(shifted[7:0]);
+        return b8[7] ? 8'sh80 : 8'sh7F;
+    endfunction
+
+    // 3-level dot product reference: flatten then INT8 MAC
+    function automatic logic [31:0] ref_d_fp32_3level(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic signed [9:0] exp_total,
+        input logic [1:0] p0_shift_a, p1_shift_a,
+        input logic [1:0] p0_shift_b, p1_shift_b,
+        input int i, j, b_off
+    );
+        logic signed [31:0] d;
+        real fp_d, c_r, result_r;
+        logic [1:0] sha, shb;
+        d = '0;
+        for (int k = 0; k < TCU_TC_K; k++)
+            for (int b = 0; b < 4; b++) begin
+                sha = (b >= 2) ? p1_shift_a : p0_shift_a;
+                shb = (b >= 2) ? p1_shift_b : p0_shift_b;
+                d += ref_3level_flatten_byte(rs1[i*TCU_TC_K+k][b*8+:8], sha)
+                   * ref_3level_flatten_byte(rs2[b_off+j*TCU_TC_K+k][b*8+:8], shb);
+            end
+        fp_d     = real'($signed(d)) * ref_pow2(int'($signed(exp_total)));
+        c_r      = ref_fp32_to_real(rs3[i * TCU_TC_N + j]);
+        result_r = fp_d + c_r;
+        return ref_real_to_fp32(result_r);
+    endfunction
+
     // Integer dot product
     function automatic logic signed [31:0] ref_dot(
         input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2,
@@ -152,6 +256,68 @@ module tb_tcu_wmma;
                 d += $signed(rs1[i*TCU_TC_K + k][8*b+7 -: 8])
                    * $signed(rs2[b_off + j*TCU_TC_K + k][8*b+7 -: 8]);
         return d;
+    endfunction
+
+    // FP8 E4M3 decode: {s[1], e[3:0], m[2:0]}, bias=7
+    //   HW flush-to-zero (FTZ): e=0 → ±0 (both zero AND subnormal flushed)
+    //   NaN: e=0xF, m=0x7 → return 0.0 (undefined; ref treats as 0)
+    function automatic real ref_fp8e4m3_to_real(input logic [7:0] fp8);
+        logic s; logic [3:0] e; logic [2:0] m; real val;
+        s = fp8[7]; e = fp8[6:3]; m = fp8[2:0];
+        if (e == 4'hF && m == 3'h7) return 0.0;  // NaN
+        if (e == 4'h0) return 0.0;  // zero AND subnormal → HW flush-to-zero
+        val = (1.0 + real'(m) / 8.0) * ref_pow2(int'(e) - 7);  // normal
+        return s ? -val : val;
+    endfunction
+
+    // FP8 E5M2 decode: {s[1], e[4:0], m[1:0]}, bias=15
+    //   subnormal (e=0): 0.mant × 2^(1-15)
+    //   Inf: e=0x1F, m=0 → return ±1e38 (large finite; overflow → FP32 Inf in ref_real_to_fp32)
+    //   NaN: e=0x1F, m≠0 → return 0.0
+    function automatic real ref_fp8e5m2_to_real(input logic [7:0] fp8);
+        logic s; logic [4:0] e; logic [1:0] m; real val;
+        s = fp8[7]; e = fp8[6:2]; m = fp8[1:0];
+        if (e == 5'h1F) begin
+            if (m == 2'h0) return s ? -1.0e39 : 1.0e39;  // Inf → overflow → FP32 Inf
+            else           return 0.0;                     // NaN → 0 for ref
+        end
+        if (e == 5'h0)
+            val = real'({1'b0, m}) / 4.0 * ref_pow2(1 - 15);  // subnormal
+        else
+            val = (1.0 + real'(m) / 4.0) * ref_pow2(int'(e) - 15);  // normal
+        return s ? -val : val;
+    endfunction
+
+    // FP8 dot product reference: sum_k sum_{elem in word} decode(A_elem) × decode(B_elem)
+    //   FP8 word packing: 2 elements per 32-bit word at [15:8] and [31:24]
+    //   fp8_fmt: TCU_FP8E4M3_ID or TCU_FP8E5M2_ID
+    function automatic logic [31:0] ref_d_fp32_fp8(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input int unsigned fp8_fmt,
+        input logic signed [9:0] exp_total,
+        input int i, j, b_off
+    );
+        real d, c_r, result_r;
+        logic [7:0] ea0, ea1, eb0, eb1;
+        d = 0.0;
+        for (int k = 0; k < TCU_TC_K; k++) begin
+            ea0 = rs1[i*TCU_TC_K + k][15:8];
+            ea1 = rs1[i*TCU_TC_K + k][31:24];
+            eb0 = rs2[b_off + j*TCU_TC_K + k][15:8];
+            eb1 = rs2[b_off + j*TCU_TC_K + k][31:24];
+            if (fp8_fmt == TCU_FP8E4M3_ID) begin
+                d += ref_fp8e4m3_to_real(ea0) * ref_fp8e4m3_to_real(eb0);
+                d += ref_fp8e4m3_to_real(ea1) * ref_fp8e4m3_to_real(eb1);
+            end else begin
+                d += ref_fp8e5m2_to_real(ea0) * ref_fp8e5m2_to_real(eb0);
+                d += ref_fp8e5m2_to_real(ea1) * ref_fp8e5m2_to_real(eb1);
+            end
+        end
+        // Apply MX block scaling (exp_total)
+        d = d * ref_pow2(int'(exp_total));
+        c_r      = ref_fp32_to_real(rs3[i * TCU_TC_N + j]);
+        result_r = d + c_r;
+        return ref_real_to_fp32(result_r);
     endfunction
 
     // FP32 reference: dot × 2^exp_total + C(FP32)
@@ -178,18 +344,24 @@ module tb_tcu_wmma;
         dispatch_if[0].valid = 1'b1;
         dispatch_if[0].data  = pkt;
         @(posedge clk);
-        while (!dispatch_if[0].ready) @(posedge clk);
+        // Use !== 1'b1 (case comparison) instead of ! to correctly handle
+        // X-state in Vivado xsim: !X = X, while(X) exits immediately.
+        while (dispatch_if[0].ready !== 1'b1) @(posedge clk);
         #1;
         dispatch_if[0].valid = 1'b0;
     endtask
 
     task automatic wait_commit(output commit_t res);
         @(posedge clk);
-        while (!commit_if[0].valid) @(posedge clk);
+        // Use !== 1'b1 (case comparison) instead of ! to correctly handle
+        // X-state in Vivado xsim: !X = X, while(X) exits immediately.
+        while (commit_if[0].valid !== 1'b1) @(posedge clk);
         res = commit_if[0].data;
     endtask
 
 `ifdef EXT_AG_TCU_ENABLE
+    // fire_ldscale: scalar backward-compat — duplicates scale_a across TC_M rows,
+    //   scale_b across TC_N cols (uniform scale case; matches all existing TCs).
     task automatic fire_ldscale(input logic [7:0] scale_a, scale_b);
         dispatch_t pkt; commit_t dummy;
         pkt                    = '0;
@@ -197,7 +369,7 @@ module tb_tcu_wmma;
         pkt.wis = '0; pkt.sid = '0; pkt.tmask = '1;
         pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
         pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
-        pkt.rs1_data[0]        = {16'b0, scale_b, scale_a};
+        pkt.rs1_data[0]        = {scale_b, scale_b, scale_a, scale_a};  // TC_M=TC_N=2
         pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
         pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
         pkt.op_args.tcu.tcu_op = TCU_OP_LDSCALE;
@@ -207,7 +379,8 @@ module tb_tcu_wmma;
 
     // fire_ldmicro: sets pair-shared micro_exp bits (uniform across all threads)
     //   mexp_a[1:0] = {pair1_mexp_a, pair0_mexp_a}
-    //   mexp_b[1:0] = {pair1_mexp_b, pair0_mexp_b}
+    //   Packing (SCALE_BITS=2, CTX_W=4): meta_arr[0]={0,pair0}, meta_arr[1]={0,pair1}
+    //   rs1_data[t][3:0] = {1'b0, pair1, 1'b0, pair0} → shift 0 or 1 per pair
     task automatic fire_ldmicro(input logic [1:0] mexp_a, mexp_b);
         dispatch_t pkt; commit_t dummy;
         pkt                    = '0;
@@ -216,8 +389,33 @@ module tb_tcu_wmma;
         pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
         pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
         for (int t = 0; t < `SIMD_WIDTH; t++) begin
-            pkt.rs1_data[t] = {30'b0, mexp_a};
-            pkt.rs2_data[t] = {30'b0, mexp_b};
+            pkt.rs1_data[t] = {28'b0, 1'b0, mexp_a[1], 1'b0, mexp_a[0]};
+            pkt.rs2_data[t] = {28'b0, 1'b0, mexp_b[1], 1'b0, mexp_b[0]};
+        end
+        pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
+        pkt.op_args.tcu.tcu_op = TCU_OP_LDMICRO;
+        fire_dispatch(pkt);
+        wait_commit(dummy);
+    endtask
+
+    // fire_ldmicro_3level: sets 2-bit combined shifts per pair for TCU_3LEVEL_ID
+    //   pair0_shift = level2 + level3_pair0 (0-2), pair1_shift = level2 + level3_pair1 (0-2)
+    //   Packing: meta_arr[0]=pair0_shift[1:0], meta_arr[1]=pair1_shift[1:0]
+    //   rs1_data[t][3:0] = {pair1_shift_a[1:0], pair0_shift_a[1:0]}
+    task automatic fire_ldmicro_3level(
+        input logic [1:0] pair0_shift_a, pair1_shift_a,
+        input logic [1:0] pair0_shift_b, pair1_shift_b
+    );
+        dispatch_t pkt; commit_t dummy;
+        pkt                    = '0;
+        pkt.uuid               = UUID_WIDTH'('hDEAD);
+        pkt.wis = '0; pkt.sid = '0; pkt.tmask = '1;
+        pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
+        for (int t = 0; t < `SIMD_WIDTH; t++) begin
+            pkt.rs1_data[t] = {28'b0, pair1_shift_a, pair0_shift_a};
+            pkt.rs2_data[t] = {28'b0, pair1_shift_b, pair0_shift_b};
         end
         pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
         pkt.op_args.tcu.fmt_d  = 4'(TCU_I32_ID);
@@ -227,7 +425,7 @@ module tb_tcu_wmma;
     endtask
 `endif
 
-    // Build INT8 dispatch packet (Phase 10: fmt_d=FP32 since output is FP32)
+    // Build INT8 dispatch packet (fmt_d=FP32: INT FEDP outputs FP32)
     function automatic dispatch_t build_dispatch_int(
         input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
         input logic [3:0] step_m, step_n
@@ -240,7 +438,7 @@ module tb_tcu_wmma;
         pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
         pkt.rs1_data = rs1; pkt.rs2_data = rs2; pkt.rs3_data = rs3;
         pkt.op_args.tcu.fmt_s  = 4'(TCU_I8_ID);
-        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);   // Phase 10: INT path → FP32 output
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
         pkt.op_args.tcu.step_m = step_m;
         pkt.op_args.tcu.step_n = step_n;
 `ifdef EXT_AG_TCU_ENABLE
@@ -250,7 +448,7 @@ module tb_tcu_wmma;
     endfunction
 
 `ifdef EXT_AG_TCU_ENABLE
-    // Build MX9 dispatch packet (fmt_s=TCU_MX9_ID → OT flattens + routes INT)
+    // Build MX9 dispatch packet (fmt_s=TCU_MX9_ID; OT patches to I8_ID → INT path)
     function automatic dispatch_t build_dispatch_mx9(
         input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
         input logic [3:0] step_m, step_n
@@ -262,7 +460,47 @@ module tb_tcu_wmma;
         pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
         pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
         pkt.rs1_data = rs1; pkt.rs2_data = rs2; pkt.rs3_data = rs3;
-        pkt.op_args.tcu.fmt_s  = 4'(TCU_MX9_ID);    // OT: flatten → patch to I8_ID
+        pkt.op_args.tcu.fmt_s  = 4'(TCU_MX9_ID);
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
+        pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
+        pkt.op_args.tcu.step_m = step_m;
+        pkt.op_args.tcu.step_n = step_n;
+        return pkt;
+    endfunction
+
+    // Build 3LEVEL dispatch packet (fmt_s=TCU_3LEVEL_ID; OT flattens via micro_ctx → I8_ID)
+    function automatic dispatch_t build_dispatch_3level(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic [3:0] step_m, step_n
+    );
+        dispatch_t pkt;
+        pkt                    = '0;
+        pkt.uuid               = UUID_WIDTH'(1);
+        pkt.wis = '0; pkt.sid = '0; pkt.tmask = '1;
+        pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
+        pkt.rs1_data = rs1; pkt.rs2_data = rs2; pkt.rs3_data = rs3;
+        pkt.op_args.tcu.fmt_s  = 4'(TCU_3LEVEL_ID);
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
+        pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
+        pkt.op_args.tcu.step_m = step_m;
+        pkt.op_args.tcu.step_n = step_n;
+        return pkt;
+    endfunction
+
+    // Build MXINT8 dispatch packet (fmt_s[3]=1 → INT path directly)
+    function automatic dispatch_t build_dispatch_mxint8(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic [3:0] step_m, step_n
+    );
+        dispatch_t pkt;
+        pkt                    = '0;
+        pkt.uuid               = UUID_WIDTH'(1);
+        pkt.wis = '0; pkt.sid = '0; pkt.tmask = '1;
+        pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
+        pkt.rs1_data = rs1; pkt.rs2_data = rs2; pkt.rs3_data = rs3;
+        pkt.op_args.tcu.fmt_s  = 4'(TCU_MXINT8_ID);
         pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
         pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
         pkt.op_args.tcu.step_m = step_m;
@@ -305,7 +543,7 @@ module tb_tcu_wmma;
 
     // =========================================================================
     // run_wmma: INT8 path, safe (serial) mode — all TCU_UOPS dispatches
-    // Output: FP32 bit pattern (Phase 10: INT FEDP outputs FP32)
+    // Output: FP32 bit pattern (INT FEDP outputs FP32)
     // =========================================================================
     task automatic run_wmma(
         input string name,
@@ -367,17 +605,76 @@ module tb_tcu_wmma;
 
 `ifdef EXT_AG_TCU_ENABLE
     // =========================================================================
-    // run_wmma_mx9: MX9 path with LDMICRO, safe (serial) mode
-    //   OT: flatten INT8 using micro_ctx, patch fmt_s → I8, route to INT path
-    //   Reference: apply ref_flatten_word before ref_d_fp32
+    // run_wmma_mxint8: MXINT8 path with LDSCALE, safe (serial) mode
+    // =========================================================================
+    task automatic run_wmma_mxint8(
+        input string name,
+        input logic [7:0] exp_a, exp_b
+    );
+        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_in, rs2_in, rs3_in;
+        dispatch_t pkt; commit_t res;
+        logic signed [9:0] exp_total;
+        bit test_pass;
+        exp_total = $signed({2'b0, exp_a}) + $signed({2'b0, exp_b}) - 10'sd254;
+        test_pass = 1;
+
+        fire_ldscale(exp_a, exp_b);
+
+        for (int ctr = 0; ctr < TCU_UOPS; ctr++) begin
+            int n, m, sm, sn, sk, a_off, b_off;
+            n     = (LG_N > 0) ? (ctr & ((1 << LG_N) - 1))           : 0;
+            m     = (LG_M > 0) ? ((ctr >> LG_N) & ((1 << LG_M) - 1)) : 0;
+            sm    = m; sn = n; sk = ctr >> (LG_N + LG_M);
+            a_off = (sm & (TCU_A_SUB_BLOCKS - 1)) * TCU_A_BLOCK_SIZE;
+            b_off = (sn & (TCU_B_SUB_BLOCKS - 1)) * TCU_B_BLOCK_SIZE;
+
+            rs1_in = '0;
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int kk=0; kk<TCU_TC_K; kk++)
+                    rs1_in[a_off + ii*TCU_TC_K + kk] = A_mat[sm][sk][ii][kk];
+            rs2_in = '0;
+            for (int jj=0; jj<TCU_TC_N; jj++)
+                for (int kk=0; kk<TCU_TC_K; kk++)
+                    rs2_in[b_off + jj*TCU_TC_K + kk] = B_mat[sk][sn][jj][kk];
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int jj=0; jj<TCU_TC_N; jj++)
+                    rs3_in[ii*TCU_TC_N + jj] = D_mat[sm][sn][ii][jj];
+
+            pkt = build_dispatch_mxint8(rs1_in, rs2_in, rs3_in, 4'(sm), 4'(sn));
+            fire_dispatch(pkt);
+            wait_commit(res);
+
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int jj=0; jj<TCU_TC_N; jj++) begin
+                    logic [31:0] got, exp_v;
+                    got   = res.data[ii*TCU_TC_N + jj];
+                    exp_v = ref_d_fp32(rs1_in, rs2_in, rs3_in,
+                                       exp_total, ii, jj, b_off);
+                    D_mat[sm][sn][ii][jj] = res.data[ii*TCU_TC_N + jj];
+                    if (got !== exp_v) begin
+                        $display("[FAIL] %-28s ctr=%0d [%0d][%0d] got=0x%08X exp=0x%08X",
+                                 name, ctr, ii, jj, got, exp_v);
+                        test_pass = 0;
+                    end
+                end
+        end
+        if (test_pass) begin
+            $display("[PASS] %-28s all %0d uops × %0d outputs",
+                     name, TCU_UOPS, TCU_TC_M * TCU_TC_N);
+            pass_cnt++;
+        end else
+            fail_cnt++;
+    endtask
+
+    // =========================================================================
+    // run_wmma_mx9: MX9 Option C WMMA with LDSCALE + LDMICRO
     // =========================================================================
     task automatic run_wmma_mx9(
         input string name,
         input logic [7:0] exp_a, exp_b,
-        input logic [1:0] mexp_a, mexp_b   // uniform across all threads
+        input logic [1:0] mexp_a, mexp_b
     );
         logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_in, rs2_in, rs3_in;
-        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_flat, rs2_flat;
         dispatch_t pkt; commit_t res;
         logic signed [9:0] exp_total;
         bit test_pass;
@@ -407,12 +704,6 @@ module tb_tcu_wmma;
                 for (int jj=0; jj<TCU_TC_N; jj++)
                     rs3_in[ii*TCU_TC_N + jj] = D_mat[sm][sn][ii][jj];
 
-            // Apply Phase 10 flatten (matches OT behaviour)
-            for (int t = 0; t < `SIMD_WIDTH; t++) begin
-                rs1_flat[t] = ref_flatten_word(rs1_in[t], mexp_a);
-                rs2_flat[t] = ref_flatten_word(rs2_in[t], mexp_b);
-            end
-
             pkt = build_dispatch_mx9(rs1_in, rs2_in, rs3_in, 4'(sm), 4'(sn));
             fire_dispatch(pkt);
             wait_commit(res);
@@ -421,8 +712,8 @@ module tb_tcu_wmma;
                 for (int jj=0; jj<TCU_TC_N; jj++) begin
                     logic [31:0] got, exp_v;
                     got   = res.data[ii*TCU_TC_N + jj];
-                    exp_v = ref_d_fp32(rs1_flat, rs2_flat, rs3_in,
-                                       exp_total, ii, jj, b_off);
+                    exp_v = ref_d_fp32_mx9(rs1_in, rs2_in, rs3_in,
+                                           exp_total, mexp_a, mexp_b, ii, jj, b_off);
                     D_mat[sm][sn][ii][jj] = res.data[ii*TCU_TC_N + jj];
                     if (got !== exp_v) begin
                         $display("[FAIL] %-28s ctr=%0d [%0d][%0d] got=0x%08X exp=0x%08X",
@@ -438,13 +729,77 @@ module tb_tcu_wmma;
         end else
             fail_cnt++;
     endtask
-`endif // EXT_AG_TCU_ENABLE
 
-`ifdef EXT_AG_TCU_ENABLE
+    // =========================================================================
+    // run_wmma_3level: 3-level hierarchical scale WMMA
+    //   SW pre-computes combined_shift = level2 + level3_pair (0-2) and stores via
+    //   fire_ldmicro_3level.  OT calls flatten_int8_word, patches fmt_s → I8_ID.
+    // =========================================================================
+    task automatic run_wmma_3level(
+        input string     name,
+        input logic [7:0] exp_a, exp_b,
+        input logic [1:0] p0_shift_a, p1_shift_a,
+        input logic [1:0] p0_shift_b, p1_shift_b
+    );
+        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_in, rs2_in, rs3_in;
+        dispatch_t pkt; commit_t res;
+        logic signed [9:0] exp_total;
+        bit test_pass;
+        exp_total = $signed({2'b0, exp_a}) + $signed({2'b0, exp_b}) - 10'sd254;
+        test_pass = 1;
+
+        fire_ldscale(exp_a, exp_b);
+        fire_ldmicro_3level(p0_shift_a, p1_shift_a, p0_shift_b, p1_shift_b);
+
+        for (int ctr = 0; ctr < TCU_UOPS; ctr++) begin
+            int n, m, sm, sn, sk, a_off, b_off;
+            n     = (LG_N > 0) ? (ctr & ((1 << LG_N) - 1))           : 0;
+            m     = (LG_M > 0) ? ((ctr >> LG_N) & ((1 << LG_M) - 1)) : 0;
+            sm    = m; sn = n; sk = ctr >> (LG_N + LG_M);
+            a_off = (sm & (TCU_A_SUB_BLOCKS - 1)) * TCU_A_BLOCK_SIZE;
+            b_off = (sn & (TCU_B_SUB_BLOCKS - 1)) * TCU_B_BLOCK_SIZE;
+
+            rs1_in = '0;
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int kk=0; kk<TCU_TC_K; kk++)
+                    rs1_in[a_off + ii*TCU_TC_K + kk] = A_mat[sm][sk][ii][kk];
+            rs2_in = '0;
+            for (int jj=0; jj<TCU_TC_N; jj++)
+                for (int kk=0; kk<TCU_TC_K; kk++)
+                    rs2_in[b_off + jj*TCU_TC_K + kk] = B_mat[sk][sn][jj][kk];
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int jj=0; jj<TCU_TC_N; jj++)
+                    rs3_in[ii*TCU_TC_N + jj] = D_mat[sm][sn][ii][jj];
+
+            pkt = build_dispatch_3level(rs1_in, rs2_in, rs3_in, 4'(sm), 4'(sn));
+            fire_dispatch(pkt);
+            wait_commit(res);
+
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int jj=0; jj<TCU_TC_N; jj++) begin
+                    logic [31:0] got, exp_v;
+                    got   = res.data[ii*TCU_TC_N + jj];
+                    exp_v = ref_d_fp32_3level(rs1_in, rs2_in, rs3_in,
+                                              exp_total, p0_shift_a, p1_shift_a,
+                                              p0_shift_b, p1_shift_b, ii, jj, b_off);
+                    D_mat[sm][sn][ii][jj] = res.data[ii*TCU_TC_N + jj];
+                    if (got !== exp_v) begin
+                        $display("[FAIL] %-28s ctr=%0d [%0d][%0d] got=0x%08X exp=0x%08X",
+                                 name, ctr, ii, jj, got, exp_v);
+                        test_pass = 0;
+                    end
+                end
+        end
+        if (test_pass) begin
+            $display("[PASS] %-28s all %0d uops × %0d outputs",
+                     name, TCU_UOPS, TCU_TC_M * TCU_TC_N);
+            pass_cnt++;
+        end else
+            fail_cnt++;
+    endtask
+
     // =========================================================================
     // fire_flat_uop: send one FLAT UOP and wait for commit
-    //   tile_type: 0=A tile (uses mexp_a from micro_ctx), 1=B tile (uses mexp_b)
-    //   rs1_word: uniform tile register content for all threads
     // =========================================================================
     task automatic fire_flat_uop(
         input logic        tile_type,
@@ -468,16 +823,14 @@ module tb_tcu_wmma;
 
     // =========================================================================
     // run_wmma_flat: LDMICRO → TCU_FLAT_UOPS FLAT UOPs → verify all commits
-    //   Sends NRA A-tile UOPs (tile_type=0) then NRB B-tile UOPs (tile_type=1).
-    //   Each UOP verifies all TCU_TC_M×TCU_TC_N output slots match exp_*_flat.
     // =========================================================================
     task automatic run_wmma_flat(
         input string       name,
         input logic [1:0]  mexp_a, mexp_b,
-        input logic [31:0] a_word,      // uniform input for each A-tile register
-        input logic [31:0] b_word,      // uniform input for each B-tile register
-        input logic [31:0] exp_a_flat,  // expected flattened output for A-tile
-        input logic [31:0] exp_b_flat   // expected flattened output for B-tile
+        input logic [31:0] a_word,
+        input logic [31:0] b_word,
+        input logic [31:0] exp_a_flat,
+        input logic [31:0] exp_b_flat
     );
         commit_t res;
         bit test_pass;
@@ -510,6 +863,94 @@ module tb_tcu_wmma;
         end else
             fail_cnt++;
     endtask
+`ifdef TCU_BHF
+    // Build FP8 dispatch packet
+    function automatic dispatch_t build_dispatch_fp8(
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic [3:0] fmt_s,
+        input logic [3:0] step_m, step_n
+    );
+        dispatch_t pkt;
+        pkt                    = '0;
+        pkt.uuid               = UUID_WIDTH'(1);
+        pkt.wis = '0; pkt.sid = '0; pkt.tmask = '1;
+        pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
+        pkt.rs1_data = rs1; pkt.rs2_data = rs2; pkt.rs3_data = rs3;
+        pkt.op_args.tcu.fmt_s  = fmt_s;
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
+        pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
+        pkt.op_args.tcu.step_m = step_m;
+        pkt.op_args.tcu.step_n = step_n;
+        return pkt;
+    endfunction
+
+    // =========================================================================
+    // run_wmma_fp8: FP8 path, safe (serial) mode — all TCU_UOPS dispatches
+    //   fp8_fmt: TCU_FP8E4M3_ID or TCU_FP8E5M2_ID
+    //   Reference: ref_d_fp32_fp8 (real-arithmetic FP8 dot product + C)
+    //   Note: LDSCALE exp_total is unused by FP path; fire_ldscale maintains warp state.
+    // =========================================================================
+    task automatic run_wmma_fp8(
+        input string       name,
+        input logic [3:0]  fp8_fmt,
+        input logic [7:0]  exp_a, exp_b
+    );
+        logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1_in, rs2_in, rs3_in;
+        dispatch_t pkt; commit_t res;
+        bit test_pass;
+        test_pass = 1;
+
+        fire_ldscale(exp_a, exp_b);
+
+        for (int ctr = 0; ctr < TCU_UOPS; ctr++) begin
+            int n, m, sm, sn, sk, a_off, b_off;
+            n     = (LG_N > 0) ? (ctr & ((1 << LG_N) - 1))           : 0;
+            m     = (LG_M > 0) ? ((ctr >> LG_N) & ((1 << LG_M) - 1)) : 0;
+            sm    = m; sn = n; sk = ctr >> (LG_N + LG_M);
+            a_off = (sm & (TCU_A_SUB_BLOCKS - 1)) * TCU_A_BLOCK_SIZE;
+            b_off = (sn & (TCU_B_SUB_BLOCKS - 1)) * TCU_B_BLOCK_SIZE;
+
+            rs1_in = '0;
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int kk=0; kk<TCU_TC_K; kk++)
+                    rs1_in[a_off + ii*TCU_TC_K + kk] = A_mat[sm][sk][ii][kk];
+            rs2_in = '0;
+            for (int jj=0; jj<TCU_TC_N; jj++)
+                for (int kk=0; kk<TCU_TC_K; kk++)
+                    rs2_in[b_off + jj*TCU_TC_K + kk] = B_mat[sk][sn][jj][kk];
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int jj=0; jj<TCU_TC_N; jj++)
+                    rs3_in[ii*TCU_TC_N + jj] = D_mat[sm][sn][ii][jj];
+
+            pkt = build_dispatch_fp8(rs1_in, rs2_in, rs3_in, fp8_fmt, 4'(sm), 4'(sn));
+            fire_dispatch(pkt);
+            wait_commit(res);
+
+            for (int ii=0; ii<TCU_TC_M; ii++)
+                for (int jj=0; jj<TCU_TC_N; jj++) begin
+                    logic [31:0] got, exp_v;
+                    logic signed [9:0] exp_total;
+                    exp_total = $signed({2'b0, exp_a}) + $signed({2'b0, exp_b}) - 10'sd254;
+                    got   = res.data[ii*TCU_TC_N + jj];
+                    exp_v = ref_d_fp32_fp8(rs1_in, rs2_in, rs3_in,
+                                           fp8_fmt, exp_total, ii, jj, b_off);
+                    D_mat[sm][sn][ii][jj] = res.data[ii*TCU_TC_N + jj];
+                    if (got !== exp_v) begin
+                        $display("[FAIL] %-28s ctr=%0d [%0d][%0d] got=0x%08X exp=0x%08X",
+                                 name, ctr, ii, jj, got, exp_v);
+                        test_pass = 0;
+                    end
+                end
+        end
+        if (test_pass) begin
+            $display("[PASS] %-28s all %0d uops × %0d outputs",
+                     name, TCU_UOPS, TCU_TC_M * TCU_TC_N);
+            pass_cnt++;
+        end else
+            fail_cnt++;
+    endtask
+`endif // TCU_BHF
 `endif // EXT_AG_TCU_ENABLE
 
     // =========================================================================
@@ -524,176 +965,76 @@ module tb_tcu_wmma;
         reset = 1'b0;
         @(posedge clk); #1;
 
-        $display("=== tb_tcu_wmma: Phase 10 FP32 INT path validation ===");
+        $display("=== tb_tcu_wmma: V1-V8 format validation ===");
         $display("  TCU_TC_M=%0d  TCU_TC_N=%0d  TCU_TC_K=%0d",
                  TCU_TC_M, TCU_TC_N, TCU_TC_K);
         $display("  UOPS=%0d  M_STEPS=%0d  N_STEPS=%0d  K_STEPS=%0d",
                  TCU_UOPS, TCU_M_STEPS, TCU_N_STEPS, TCU_K_STEPS);
         $display("------------------------------------------------------------");
 
-        // --------------------------------------------------------------------
-        // TC_int_k_accum: INT8 path K-accumulation regression
-        //   A=B=0x01010101 (INT8=1), exp_total=0, D starts at 0.0 (FP32)
-        //   Per k-step: dot = TC_K×4×1×1 = 8 → adds FP32 8.0 each step
-        //   Final D = FP32(8 × K_STEPS) per (i,j) output
-        //     NT=4: K_STEPS=2 → 16.0 = 0x41800000
-        //     NT=8: K_STEPS=4 → 32.0 = 0x42000000
-        // --------------------------------------------------------------------
-        fill_A(32'h01010101); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma("TC_int_k_accum", 8'd127, 8'd127);
+`ifdef TCU_TEST_INT8
+        $display("--- INT8 ---");
+        `include "tc/int8.svh"
+
+`elsif TCU_TEST_MXINT8
+        $display("--- MXINT8 ---");
+`ifdef EXT_AG_TCU_ENABLE
+        `include "tc/mxint8.svh"
+`endif
+
+`elsif TCU_TEST_MX9
+        $display("--- MX9 ---");
+`ifdef EXT_AG_TCU_ENABLE
+        `include "tc/mx9.svh"
+`endif
+
+`elsif TCU_TEST_FLAT
+        $display("--- FLAT ---");
+`ifdef EXT_AG_TCU_ENABLE
+        `include "tc/flat.svh"
+`endif
+
+`elsif TCU_TEST_FP8
+        $display("--- FP8 ---");
+`ifdef EXT_AG_TCU_ENABLE
+        `include "tc/fp8.svh"
+`endif
+
+`elsif TCU_TEST_MXFP8
+        $display("--- MXFP8 ---");
+`ifdef EXT_AG_TCU_ENABLE
+        `include "tc/mxfp8.svh"
+`endif
+
+`elsif TCU_TEST_3LEVEL
+        $display("--- 3LEVEL ---");
+`ifdef EXT_AG_TCU_ENABLE
+        `include "tc/3level.svh"
+`endif
+
+`else
+        // Default: run all formats
+        $display("--- INT8 ---");
+        `include "tc/int8.svh"
 
 `ifdef EXT_AG_TCU_ENABLE
-        // --------------------------------------------------------------------
-        // TC_int_exp_pos2: exp_total=+2 (scale_a=128, scale_b=128)
-        //   Must run before any MX9 test that sets mexp≠0 (do_flatten_int
-        //   applies to INT8 path; mexp=0 from reset = passthrough).
-        //   A=B=0x01010101 (INT8=1 each byte), D=0.0
-        //   dot per k-step = TC_TC_K×4 × 1×1 = 8
-        //   SCALE: FP32(8) × 2^2 = 32.0 per k-step
-        //   K accumulation (sk=0→32.0, sk=1→64.0):
-        //     NT=4: K_STEPS=2 → final D = 64.0 = 0x42800000
-        //     NT=8: K_STEPS=4 → final D = 128.0 = 0x43000000
-        // --------------------------------------------------------------------
-        fill_A(32'h01010101); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma("TC_int_exp_pos2", 8'd128, 8'd128);
+        $display("--- MXINT8 ---");
+        `include "tc/mxint8.svh"
 
-        // --------------------------------------------------------------------
-        // TC_int_exp_neg1: exp_total=-1 (scale_a=127, scale_b=126)
-        //   A=B=0x02020202 (INT8=2 each byte), D=0.0
-        //   dot per k-step = TC_TC_K×4 × 2×2 = 32
-        //   SCALE: FP32(32) × 2^(-1) = 16.0 per k-step
-        //   K accumulation (sk=0→16.0, sk=1→32.0):
-        //     NT=4: K_STEPS=2 → final D = 32.0 = 0x42000000
-        //     NT=8: K_STEPS=4 → final D = 64.0 = 0x42800000
-        // --------------------------------------------------------------------
-        fill_A(32'h02020202); fill_B(32'h02020202); fill_D(32'h00000000);
-        run_wmma("TC_int_exp_neg1", 8'd127, 8'd126);
+        $display("--- MX9 ---");
+        `include "tc/mx9.svh"
 
-        // --------------------------------------------------------------------
-        // TC_nonzero_C: accumulate onto non-zero C (fp32_add with mixed sign)
-        //   A=B=0x01010101 (INT8=1), exp_total=0, D starts at FP32(-8.0)
-        //   sk=0: dot=8, 8.0+(-8.0)=0.0 → D_mat=0.0
-        //   sk=1: dot=8, 8.0+0.0=8.0    → D_mat=8.0
-        //     NT=4: K_STEPS=2 → final D = 8.0 = 0x41000000
-        //     NT=8: K_STEPS=4 → 0+8+16+24? No: sk0→0, sk1→8, sk2→16, sk3→24 = 24.0
-        //       Final D = 24.0 = 0x41C00000
-        // --------------------------------------------------------------------
-        fill_A(32'h01010101); fill_B(32'h01010101);
-        fill_D(32'hC1000000);   // FP32(-8.0)
-        run_wmma("TC_nonzero_C", 8'd127, 8'd127);
+        $display("--- FLAT ---");
+        `include "tc/flat.svh"
 
-        // --------------------------------------------------------------------
-        // TC_neg_A: negative INT8 input (A=0xFF = INT8(-1))
-        //   A=0xFFFFFFFF (INT8=-1 each), B=0x01010101 (INT8=+1), D=0.0
-        //   dot per k-step = TC_TC_K×4 × (-1)×1 = -8
-        //   FP32(-8.0) per k-step, exp_total=0
-        //   K accumulation (sk=0→-8.0, sk=1→-16.0):
-        //     NT=4: K_STEPS=2 → final D = -16.0 = 0xC1800000
-        //     NT=8: K_STEPS=4 → final D = -32.0 = 0xC2000000
-        // --------------------------------------------------------------------
-        fill_A(32'hFFFFFFFF); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma("TC_neg_A", 8'd127, 8'd127);
+        `include "tc/fp8.svh"
 
-        // --------------------------------------------------------------------
-        // TC_MX9_mexp0: MX9 with all mexp=0 (identity flatten)
-        //   Expects same result as TC_int_k_accum (flatten is no-op)
-        // --------------------------------------------------------------------
-        fill_A(32'h01010101); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma_mx9("TC_MX9_mexp0", 8'd127, 8'd127, 2'b00, 2'b00);
+        $display("--- MXFP8 ---");
+        `include "tc/mxfp8.svh"
 
-        // --------------------------------------------------------------------
-        // TC_MX9_mexp_a1: MX9 with mexp_a=1 (all pairs), mexp_b=0
-        //   A=0x01 (INT8=1) → flatten(1, mexp=1) = 2 (no overflow)
-        //   B=0x01 (INT8=1) → flatten(1, mexp=0) = 1
-        //   Per k-step: dot = TC_K×4 × 2×1 = 16 → adds FP32 16.0 each step
-        //   K accumulation (sk=0→16.0, sk=1→32.0):
-        //     NT=4: K_STEPS=2 → final D = 32.0 = 0x42000000
-        //     NT=8: K_STEPS=4 → final D = 64.0 = 0x42800000
-        // --------------------------------------------------------------------
-        fill_A(32'h01010101); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma_mx9("TC_MX9_mexp_a1", 8'd127, 8'd127, 2'b11, 2'b00);
-
-        // --------------------------------------------------------------------
-        // TC_MX9_mexp_mixed: pair1_mexp=1, pair0_mexp=0 (mixed pair-shared)
-        //   mexp_a=2'b10: bit[1]=pair1=1, bit[0]=pair0=0
-        //   A=0x01010101 → flatten: pair0 bytes(0,1)→0x01, pair1 bytes(2,3)→0x02
-        //   flat A = 0x02020101 per thread word
-        //   B=0x01010101, mexp_b=0 → unchanged
-        //   dot per word: b0(1×1)=1, b1(1×1)=1, b2(2×1)=2, b3(2×1)=2 → 6
-        //   dot per k-step = 6 × TC_TC_K = 12; FP32(12.0) per k-step, exp_total=0
-        //   K accumulation (sk=0→12.0, sk=1→24.0):
-        //     NT=4: K_STEPS=2 → final D = 24.0 = 0x41C00000
-        //     NT=8: K_STEPS=4 → final D = 48.0 = 0x42400000
-        // --------------------------------------------------------------------
-        fill_A(32'h01010101); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma_mx9("TC_MX9_mexp_mixed", 8'd127, 8'd127, 2'b10, 2'b00);
-
-        // --------------------------------------------------------------------
-        // TC_MX9_sat_pos: saturation overflow_pos path (0x40 + mexp=1 → 0x7F)
-        //   A=0x40404040 (INT8=+64): bit7=0, bit6=1 → overflow_pos → 0x7F=127
-        //   flat A = 0x7F7F7F7F per thread word
-        //   B=0x01010101 (INT8=1), mexp_b=0 → unchanged
-        //   dot per k-step = 4×TC_TC_K × 127×1 = 4×2×127 = 1016
-        //   FP32(1016.0) per k-step, exp_total=0
-        //   K accumulation (sk=0→1016.0, sk=1→2032.0):
-        //     NT=4: K_STEPS=2 → final D = 2032.0 = 0x447E0000
-        //     NT=8: K_STEPS=4 → final D = 4064.0 = 0x457E0000
-        // --------------------------------------------------------------------
-        fill_A(32'h40404040); fill_B(32'h01010101); fill_D(32'h00000000);
-        run_wmma_mx9("TC_MX9_sat_pos", 8'd127, 8'd127, 2'b11, 2'b00);
-
-        // --------------------------------------------------------------------
-        // FLAT instruction tests (Phase B)
-        //   run_wmma_flat: LDMICRO → NRA A-tile UOPs + NRB B-tile UOPs
-        //   Verifies full FLAT sequence including A/B tile isolation.
-        // --------------------------------------------------------------------
-
-        // TC_FLAT_full_ident: mexp=0 → all passthrough (regression)
-        //   A=0x01020304, B=0x05060708 → no change
-        run_wmma_flat("TC_FLAT_full_ident",
-            2'b00, 2'b00,
-            32'h01020304, 32'h05060708,
-            32'h01020304, 32'h05060708);
-
-        // TC_FLAT_full_double: mexp_a=11 → A×2, mexp_b=00 → B passthrough
-        //   Verifies A-tile flatten AND isolation (mexp_a not applied to B-tile)
-        //   A=0x01010101 → 0x02020202; B=0x01010101 → 0x01010101
-        run_wmma_flat("TC_FLAT_full_double",
-            2'b11, 2'b00,
-            32'h01010101, 32'h01010101,
-            32'h02020202, 32'h01010101);
-
-        // TC_FLAT_full_mixed: mexp_a=2'b10 (pair1=1, pair0=0)
-        //   pair0 bytes (0,1): no shift → unchanged
-        //   pair1 bytes (2,3): ×2
-        //   A=0x01020304 → pair0(0x04,0x03)→0x04,0x03; pair1(0x02,0x01)→0x04,0x02
-        //   flat_a = 0x02040304
-        run_wmma_flat("TC_FLAT_full_mixed",
-            2'b10, 2'b00,
-            32'h01020304, 32'h01020304,
-            32'h02040304, 32'h01020304);
-
-        // TC_FLAT_then_WMMA: use FLAT output as WMMA input (integration)
-        //   Step 1: FLAT A-tile (mexp_a=11, 0x01→0x02) — capture flattened data
-        //   Step 2: reset micro_ctx (mexp=00) so WMMA INT path doesn't re-flatten
-        //   Step 3: INT8 WMMA with captured A=0x02020202, B=0x01010101, D=0
-        //   Expected: dot per k-step = TC_K×4 × 2×1 = 16 → FP32 16.0/k-step
-        //     NT=4: K_STEPS=2 → 32.0 = 0x42000000
-        //     NT=8: K_STEPS=4 → 64.0 = 0x42800000
-        begin : tc_flat_then_wmma
-            logic [31:0] captured_a;
-            commit_t flat_res;
-            fire_ldmicro(2'b11, 2'b00);
-            for (int i = 0; i < TCU_FLAT_UOPS; i++) begin
-                logic tile_type_l;
-                tile_type_l = (i >= TCU_NRA) ? 1'b1 : 1'b0;
-                fire_flat_uop(tile_type_l, 32'h01010101, flat_res);
-                if (i == 0) captured_a = flat_res.data[0];  // expect 0x02020202
-            end
-            fire_ldmicro(2'b00, 2'b00);  // reset micro_ctx → WMMA passthrough
-            fill_A(captured_a); fill_B(32'h01010101); fill_D(32'h00000000);
-            run_wmma("TC_FLAT_then_WMMA", 8'd127, 8'd127);
-        end
+        $display("--- 3LEVEL ---");
+        `include "tc/3level.svh"
+`endif
 `endif
 
         $display("------------------------------------------------------------");

@@ -1,17 +1,20 @@
 // =============================================================================
 // tb_tcu_unit.sv — VX_tcu_unit system-level testbench (Verilator --timing)
 // =============================================================================
-// Phase 10: MX9 = standard INT8 (2's complement) + micro_exp via LDMICRO.
-// INT path FEDP now outputs FP32:
+// MXINT8/MX9 포맷 분리: MXINT8(id=13, E8M0+INT8, no micro_exp), MX9(id=4, 미구현)
+// INT path FEDP outputs FP32:
 //   INT8 MAC → INT32 dot → FP32(×2^exp_total) + FP32 C accumulation.
 //
 // Tests:
 //   TC1:                INT8 WMMA basic regression (exp_total=0 → FP32 8.0)
 //   TC_hazard:          LDSCALE hazard lock (FP32 expected values)
-//   TC_MX9_mexp0:       MX9 WMMA, mexp=0 (identity flatten) → FP32 8.0
-//   TC_MX9_mexp_a1:     MX9 WMMA, mexp_a=1 (A×2), mexp_b=0 → FP32 16.0
-//   TC_MX9_sat_pos:     MX9 WMMA, A=0x40 (+64), mexp=1 → saturate +127 → FP32 1016.0
-//   TC_MX9_sat_neg:     MX9 WMMA, A=0x80 (-128), mexp=1 → saturate -128 → FP32 -1024.0
+//   TC_MXINT8_scale:    MXINT8 WMMA, A=B=1, exp_total=+2 → FP32 32.0
+//   TC_MXINT8_neg_A:    MXINT8 WMMA, A=-1, B=1, exp_total=0 → FP32 -8.0
+//   TC_MX9_rq_mexp0:    MX9 re-quant, A=B=0x00, mexp=0 → 8.0
+//   TC_MX9_rq_mexp1:    MX9 re-quant, A=B=0x00, mexp=1 → 32.0
+//   TC_MX9_rq_maxval:   MX9 re-quant, A=B=0x7F, mexp=1 → 126.0078125
+//   TC_MX9_rq_neg:      MX9 re-quant, A=0x80(neg), B=0x00, mexp=0 → -8.0
+//   TC_MX9_rq_mixed_pair: MX9, pair0_mexp=0/pair1_mexp=1 → 18.0
 //   TC_FLAT_identity:   FLAT, mexp=0 → passthrough
 //   TC_FLAT_a_double:   FLAT A-tile, mexp_a=2'b11 → ×2
 //   TC_FLAT_b_double:   FLAT B-tile, mexp_b=2'b11 → ×2
@@ -20,6 +23,13 @@
 //   TC_FLAT_sat_neg:    FLAT A-tile, -128 + mexp=1 → overflow_neg → -128
 //   TC_FLAT_iso_a_notb: FLAT B-tile with mexp_a=11/mexp_b=00 → passthrough (isolation)
 //   TC_FLAT_neg_no_sat: FLAT A-tile, INT8=-2 + mexp=1 → -4 (normal neg shift)
+//   TC_FP8E4M3_normal:  FP8 E4M3, A=B=1.0, exp_total=0 → 4.0
+//   TC_FP8E4M3_scale:   FP8 E4M3, A=B=1.0, exp_total=+4 → 64.0
+//   TC_FP8E4M3_subnormal: FP8 E4M3 subnormal → flush-to-zero → 0.0
+//   TC_FP8E4M3_nan:     FP8 E4M3 NaN → NaN output
+//   TC_FP8E4M3_neg:     FP8 E4M3, A=-1.0, B=1.0 → -4.0 (sign propagation)
+//   TC_FP8E5M2_normal:  FP8 E5M2, A=B=1.0, exp_total=0 → 4.0
+//   TC_FP8E5M2_inf:     FP8 E5M2 +Inf × 1.0 → +Inf
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -280,16 +290,62 @@ module tb_tcu_unit;
 
 `ifdef EXT_AG_TCU_ENABLE
     // =========================================================================
-    // run_test_mx9: MX9 WMMA (fmt_s=TCU_MX9_ID) with LDMICRO + LDSCALE
-    //   OT: flatten INT8 using micro_ctx, then patch fmt_s → TCU_I8_ID
+    // run_test_mxint8: MXINT8 WMMA (fmt_s=TCU_MXINT8_ID) with LDSCALE
+    //   MXINT8: E8M0 block exponent + Signed INT8, no micro_exp
     //   exp_d: expected FP32 bit pattern (all TC_M×TC_N outputs must match)
+    // =========================================================================
+    task automatic run_test_mxint8(
+        input string name,
+        input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
+        input logic [7:0] scale_a, scale_b,
+        input logic [31:0] exp_d             // expected FP32 result for all outputs
+    );
+        dispatch_t pkt; commit_t res;
+        bit test_pass;
+
+        fire_ldscale(scale_a, scale_b);
+
+        pkt = '0;
+        pkt.uuid = UUID_WIDTH'(1); pkt.wis = '0; pkt.sid = '0;
+        pkt.tmask = '1; pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+        pkt.op_type            = INST_ALU_BITS'(INST_TCU_WMMA);
+        pkt.rs1_data           = rs1; pkt.rs2_data = rs2; pkt.rs3_data = rs3;
+        pkt.op_args.tcu.fmt_s  = 4'(TCU_MXINT8_ID);
+        pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
+        pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
+        fire_dispatch(pkt);
+        wait_commit(res);
+
+        test_pass = 1;
+        for (int i = 0; i < TCU_TC_M; i++)
+            for (int j = 0; j < TCU_TC_N; j++) begin
+                logic [31:0] got = res.data[i*TCU_TC_N+j];
+                if (got !== exp_d) begin
+                    $display("[FAIL] %-28s [%0d][%0d] got=0x%08X exp=0x%08X",
+                             name, i, j, got, exp_d);
+                    test_pass = 0;
+                end
+            end
+
+        if (test_pass) begin
+            $display("[PASS] %-28s all %0d outputs = 0x%08X",
+                     name, TCU_TC_M*TCU_TC_N, exp_d);
+            pass_cnt++;
+        end else fail_cnt++;
+    endtask
+
+    // =========================================================================
+    // run_test_mx9: MX9 Option C WMMA (fmt_s=TCU_MX9_ID)
+    //   Sequence: LDSCALE → LDMICRO → WMMA (1 uop)
+    //   OT: Q=128+frac, flat=Q>>(2-mexp); exp_total-=10; fmt_s→I8_ID
+    //   exp_d: expected FP32 bit pattern (all TCU_TC_M×TCU_TC_N outputs must match)
     // =========================================================================
     task automatic run_test_mx9(
         input string name,
         input logic [`SIMD_WIDTH-1:0][`XLEN-1:0] rs1, rs2, rs3,
         input logic [7:0] scale_a, scale_b,
-        input logic [1:0] mexp_a, mexp_b,   // uniform across all threads
-        input logic [31:0] exp_d             // expected FP32 result for all outputs
+        input logic [1:0] mexp_a, mexp_b,  // {pair1,pair0} for all threads
+        input logic [31:0] exp_d
     );
         dispatch_t pkt; commit_t res;
         bit test_pass;
@@ -488,48 +544,79 @@ module tb_tcu_unit;
         end
 
         // ====================================================================
-        // MX9 WMMA tests with LDMICRO (Phase 10)
-        //   dot element = Σ_{k,b} flatten(A[k][b], mexp_a) × flatten(B[k][b], mexp_b)
+        // MXINT8 WMMA tests (fmt_s=TCU_MXINT8_ID, E8M0 + INT8, no micro_exp)
+        //   dot = Σ_{k,b} INT8_A[k][b] × INT8_B[k][b]
         //   sum = TCU_TC_K=2 words × 4 bytes = 8 elements per output cell
         //
-        // TC_MX9_mexp0:
-        //   A=B=0x01 (INT8=1), mexp=0 → flat=1, dot=8 → FP32 8.0 = 0x41000000
+        // TC_MXINT8_basic:
+        //   A=B=0x01 (INT8=1), exp_total=0 → dot=8 → FP32 8.0 = 0x41000000
         //
-        // TC_MX9_mexp_a1:
-        //   A=0x01 (INT8=1), mexp_a=1 → flat=2; B=0x01, mexp_b=0 → flat=1
-        //   dot = 8 × 2×1 = 16 → FP32 16.0 = 0x41800000
+        // TC_MXINT8_scale:
+        //   A=B=0x01 (INT8=1), scale_a=128, scale_b=128 (exp_total=+2)
+        //   dot=8 → FP32 8.0 × 2^2 = 32.0 = 0x42000000
         //
-        // TC_MX9_sat_pos:
-        //   A=0x40 (+64 INT8), mexp_a=1 → bit7=0,bit6=1 → overflow_pos → flat=0x7F (+127)
-        //   B=0x01 (INT8=1), mexp_b=0 → flat=1
-        //   dot = 8 × 127×1 = 1016 → FP32 1016.0 = 0x447E0000
-        //   (1016 = 1.111111 × 2^9: biased_exp=136, mant=0x7E0000)
-        //
-        // TC_MX9_sat_neg:
-        //   A=0x80 (-128 INT8), mexp_a=1 → bit7=1,bit6=0 → overflow_neg → flat=0x80 (-128)
-        //   B=0x01, mexp_b=0 → flat=1
-        //   dot = 8 × (-128)×1 = -1024 → FP32 -1024.0 = 0xC4800000
+        // TC_MXINT8_neg_A:
+        //   A=0xFF (INT8=-1), B=0x01 (INT8=1), exp_total=0
+        //   dot = 8 × (-1)×1 = -8 → FP32 -8.0 = 0xC1000000
         // ====================================================================
 
-        run_test_mx9("TC_MX9_mexp0",
+        run_test_mxint8("TC_MXINT8_scale",
             fill(32'h01010101), fill(32'h01010101), fill(32'h00000000),
+            8'd128, 8'd128,
+            32'h42000000);  // 32.0 (exp_total=+2)
+
+        run_test_mxint8("TC_MXINT8_neg_A",
+            fill(32'hFFFFFFFF), fill(32'h01010101), fill(32'h00000000),
+            8'd127, 8'd127,
+            32'hC1000000);  // -8.0
+
+        // ====================================================================
+        // MX9 Option C tests
+        //   byte encoding: {s[1b], frac[6:0]}; flat = Q>>(2-mexp); exp_total-=10
+        //   dot elements per cell = TCU_TC_K=2 words × 4 bytes = 8
+        // ====================================================================
+
+        // TC_MX9_rq_mexp0: A=B=0x00 (s=0,frac=0), mexp=0 all pairs
+        //   Q=128, flat=128>>2=32 → dot=8×32×32=8192
+        //   exp_adj=0-10=-10 → fp=8192×2^(-10)=8.0=0x41000000
+        run_test_mx9("TC_MX9_rq_mexp0",
+            fill(32'h00000000), fill(32'h00000000), fill(32'h00000000),
             8'd127, 8'd127, 2'b00, 2'b00,
             32'h41000000);  // 8.0
 
-        run_test_mx9("TC_MX9_mexp_a1",
-            fill(32'h01010101), fill(32'h01010101), fill(32'h00000000),
-            8'd127, 8'd127, 2'b11, 2'b00,
-            32'h41800000);  // 16.0
+        // TC_MX9_rq_mexp1: A=B=0x00 (s=0,frac=0), mexp=1 all pairs
+        //   Q=128, flat=128>>1=64 → dot=8×64×64=32768
+        //   exp_adj=-10 → fp=32768×2^(-10)=32.0=0x42000000
+        run_test_mx9("TC_MX9_rq_mexp1",
+            fill(32'h00000000), fill(32'h00000000), fill(32'h00000000),
+            8'd127, 8'd127, 2'b11, 2'b11,
+            32'h42000000);  // 32.0
 
-        run_test_mx9("TC_MX9_sat_pos",
-            fill(32'h40404040), fill(32'h01010101), fill(32'h00000000),
-            8'd127, 8'd127, 2'b11, 2'b00,
-            32'h447E0000);  // 1016.0
+        // TC_MX9_rq_maxval: A=B=0x7F (s=0,frac=127), mexp=1 all pairs
+        //   Q=255, flat=255>>1=127 (INT8 max, no saturation) → dot=8×127×127=129032
+        //   exp_adj=-10 → fp=129032×2^(-10)=126.0078125=0x42FC0400
+        run_test_mx9("TC_MX9_rq_maxval",
+            fill(32'h7F7F7F7F), fill(32'h7F7F7F7F), fill(32'h00000000),
+            8'd127, 8'd127, 2'b11, 2'b11,
+            32'h42FC0400);  // 126.0078125
 
-        run_test_mx9("TC_MX9_sat_neg",
-            fill(32'h80808080), fill(32'h01010101), fill(32'h00000000),
-            8'd127, 8'd127, 2'b11, 2'b00,
-            32'hC4800000);  // -1024.0
+        // TC_MX9_rq_neg: A=0x80 (s=1,frac=0), B=0x00, mexp=0 all pairs
+        //   flat_A=-32, flat_B=+32 → dot=8×(-32)×32=-8192
+        //   exp_adj=-10 → -8192×2^(-10)=-8.0=0xC1000000
+        run_test_mx9("TC_MX9_rq_neg",
+            fill(32'h80808080), fill(32'h00000000), fill(32'h00000000),
+            8'd127, 8'd127, 2'b00, 2'b00,
+            32'hC1000000);  // -8.0
+
+        // TC_MX9_rq_mixed_pair: A=0x40 (s=0,frac=64), mexp_a=2'b10 (pair1=1,pair0=0)
+        //   pair0 bytes (b=0,1): Q=192, flat=192>>2=48
+        //   pair1 bytes (b=2,3): Q=192, flat=192>>1=96
+        //   B=0x00 (flat=+32 all); dot=2×(2×48×32+2×96×32)=18432
+        //   exp_adj=-10 → 18432×2^(-10)=18.0=0x41900000
+        run_test_mx9("TC_MX9_rq_mixed_pair",
+            fill(32'h40404040), fill(32'h00000000), fill(32'h00000000),
+            8'd127, 8'd127, 2'b10, 2'b00,
+            32'h41900000);  // 18.0
 
         // ====================================================================
         // FLAT instruction tests (Phase B)
@@ -585,6 +672,275 @@ module tb_tcu_unit;
         run_test_flat("TC_FLAT_neg_no_sat",
             2'b11, 2'b00, 1'b0, 32'hFEFEFEFE, 32'hFCFCFCFC);
 
+`endif // EXT_AG_TCU_ENABLE
+
+`ifdef EXT_AG_TCU_ENABLE
+        // ====================================================================
+        // Phase D: FP8 WMMA tests (TCU_BHF path)
+        //
+        // FP8 register packing: 2 FP8 per 32-bit word
+        //   word = {FP8[1][7:0], 8'h00, FP8[0][7:0], 8'h00}
+        //   i.e., FP8[0] at [15:8], FP8[1] at [31:24]
+        //
+        // NT=4, TCU_TC_K=2: 2 words/cell × 2 FP8/word = 4 elements/cell
+        //
+        // TC_FP8E4M3_normal:
+        //   A=B=[1.0 E4M3]={s=0,e=7,m=0}=0x38; word=0x38003800
+        //   dot = 4 × 1.0×1.0 = 4.0; exp_total=0; C=0 → 4.0 = 0x40800000
+        //
+        // TC_FP8E4M3_scale:
+        //   Same A/B=1.0; exp_total=+2 (scale=129/129 → 129+129-254=+4? No: 127→0)
+        //   Use scale_a=129, scale_b=129 → exp_total=129+129-254=+4
+        //   4.0 × 2^4 = 64.0 = 0x42800000
+        //
+        // TC_FP8E4M3_subnormal:
+        //   A=[subnormal]={e=0,m=1}=0x01; B=[1.0]=0x38
+        //   HANDLE_SUBNORMAL=0 → flush-to-zero → A=0 → dot=0 → 0x00000000
+        //
+        // TC_FP8E4M3_nan:
+        //   A=[NaN]={e=F,m=1}=0x79; B=[1.0]=0x38
+        //   NaN × anything = NaN → result should be NaN (FP32 NaN = any 0x7FC00000)
+        //
+        // TC_FP8E5M2_normal:
+        //   A=B=[1.0 E5M2]={s=0,e=15,m=0}=0x3C; word=0x3C003C00
+        //   dot=4.0 → 0x40800000
+        //
+        // TC_FP8E5M2_inf:
+        //   A=[+Inf E5M2]={e=1F,m=0}=0x7C; B=[1.0 E5M2]=0x3C
+        //   word_a=0x7C007C00, word_b=0x3C003C00
+        //   Inf × 1.0 = Inf → FP32 +Inf = 0x7F800000
+        //
+        // Note: FP8 path requires TCU_BHF (VX_tcu_fp BHF backend).
+        //       If TCU_BHF is not defined, skip FP8 tests gracefully.
+        // ====================================================================
+`ifdef TCU_BHF
+        begin : tc_fp8_block
+            dispatch_t pkt; commit_t res;
+            logic [31:0] fp8_1_e4m3_word;
+            logic [31:0] fp8_neg1_e4m3_word;
+            logic [31:0] fp8_subnorm_e4m3_word;
+            logic [31:0] fp8_nan_e4m3_word;
+            logic [31:0] fp8_1_e5m2_word;
+            logic [31:0] fp8_inf_e5m2_word;
+
+            // 1.0 E4M3: {s=0,e=7,m=0} = 0x38; word = 0x38003800
+            fp8_1_e4m3_word     = {8'h38, 8'h00, 8'h38, 8'h00};
+            // -1.0 E4M3: {s=1,e=7,m=0} = 0xB8; word = 0xB800B800
+            fp8_neg1_e4m3_word  = {8'hB8, 8'h00, 8'hB8, 8'h00};
+            // subnormal E4M3: {e=0,m=1} = 0x01; flush-to-zero
+            fp8_subnorm_e4m3_word = {8'h01, 8'h00, 8'h01, 8'h00};
+            // NaN E4M3: {e=F,m=1} = 0x79; word = 0x79007900
+            fp8_nan_e4m3_word   = {8'h79, 8'h00, 8'h79, 8'h00};
+            // 1.0 E5M2: {s=0,e=15,m=0} = 0x3C; word = 0x3C003C00
+            fp8_1_e5m2_word     = {8'h3C, 8'h00, 8'h3C, 8'h00};
+            // +Inf E5M2: {e=1F,m=0} = 0x7C; word = 0x7C007C00
+            fp8_inf_e5m2_word   = {8'h7C, 8'h00, 8'h7C, 8'h00};
+
+            // ----------------------------------------------------------------
+            // TC_FP8E4M3_normal: A=B=1.0 E4M3, exp_total=0, C=0 → 4.0
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd127, 8'd127);  // exp_total=0
+            pkt = '0;
+            pkt.uuid = UUID_WIDTH'(1); pkt.wis = '0; pkt.sid = '0;
+            pkt.tmask = '1; pkt.sop = 1'b1; pkt.eop = 1'b1; pkt.wb = 1'b1;
+            pkt.op_type = INST_ALU_BITS'(INST_TCU_WMMA);
+            for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                pkt.rs1_data[t] = fp8_1_e4m3_word;
+                pkt.rs2_data[t] = fp8_1_e4m3_word;
+                pkt.rs3_data[t] = 32'h00000000;
+            end
+            pkt.op_args.tcu.fmt_s  = 4'(TCU_FP8E4M3_ID);
+            pkt.op_args.tcu.fmt_d  = 4'(TCU_FP32_ID);
+            pkt.op_args.tcu.tcu_op = TCU_OP_WMMA;
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++)
+                        if (res.data[ii*TCU_TC_N+jj] !== 32'h40800000)
+                            ok = 0;
+                if (ok) begin
+                    $display("[PASS] %-28s 4.0 = 0x40800000", "TC_FP8E4M3_normal");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s got=0x%08X exp=0x40800000",
+                             "TC_FP8E4M3_normal", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // TC_FP8E4M3_scale: A=B=1.0, exp_total=+4 (scale=129/129) → 64.0
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd129, 8'd129);  // exp_total = 129+129-254 = +4
+            pkt.op_args.tcu.fmt_s = 4'(TCU_FP8E4M3_ID);
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++)
+                        if (res.data[ii*TCU_TC_N+jj] !== 32'h42800000)
+                            ok = 0;
+                if (ok) begin
+                    $display("[PASS] %-28s 64.0 = 0x42800000", "TC_FP8E4M3_scale");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s got=0x%08X exp=0x42800000",
+                             "TC_FP8E4M3_scale", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // TC_FP8E4M3_subnormal: A=subnormal (flush→0), B=1.0 → dot=0
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd127, 8'd127);
+            for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                pkt.rs1_data[t] = fp8_subnorm_e4m3_word;
+                pkt.rs2_data[t] = fp8_1_e4m3_word;
+            end
+            pkt.op_args.tcu.fmt_s = 4'(TCU_FP8E4M3_ID);
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++)
+                        if (res.data[ii*TCU_TC_N+jj] !== 32'h00000000)
+                            ok = 0;
+                if (ok) begin
+                    $display("[PASS] %-28s subnormal→0 = 0x00000000", "TC_FP8E4M3_subnormal");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s got=0x%08X exp=0x00000000",
+                             "TC_FP8E4M3_subnormal", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // TC_FP8E4M3_nan: A=NaN → output is NaN (bit31=0, exp=FF, mant≠0)
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd127, 8'd127);
+            for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                pkt.rs1_data[t] = fp8_nan_e4m3_word;
+                pkt.rs2_data[t] = fp8_1_e4m3_word;
+            end
+            pkt.op_args.tcu.fmt_s = 4'(TCU_FP8E4M3_ID);
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                // NaN check: exp=0xFF and mantissa≠0 (any NaN encoding)
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++) begin
+                        logic [31:0] got = res.data[ii*TCU_TC_N+jj];
+                        if (got[30:23] !== 8'hFF || got[22:0] == 23'h0) ok = 0;
+                    end
+                if (ok) begin
+                    $display("[PASS] %-28s NaN output confirmed", "TC_FP8E4M3_nan");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s not NaN: got=0x%08X", "TC_FP8E4M3_nan", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // TC_FP8E4M3_neg: A=-1.0 E4M3 (0xB8), B=1.0 E4M3 (0x38)
+            //   NT=4: 2 words × 2 FP8/word = 4 elements → dot=4×(-1)×1=-4
+            //   exp_total=0 → -4.0=0xC0800000
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd127, 8'd127);
+            for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                pkt.rs1_data[t] = fp8_neg1_e4m3_word;
+                pkt.rs2_data[t] = fp8_1_e4m3_word;
+                pkt.rs3_data[t] = 32'h00000000;
+            end
+            pkt.op_args.tcu.fmt_s = 4'(TCU_FP8E4M3_ID);
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++)
+                        if (res.data[ii*TCU_TC_N+jj] !== 32'hC0800000)
+                            ok = 0;
+                if (ok) begin
+                    $display("[PASS] %-28s -4.0 = 0xC0800000", "TC_FP8E4M3_neg");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s got=0x%08X exp=0xC0800000",
+                             "TC_FP8E4M3_neg", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // TC_FP8E5M2_normal: A=B=1.0 E5M2, exp_total=0 → 4.0
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd127, 8'd127);
+            for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                pkt.rs1_data[t] = fp8_1_e5m2_word;
+                pkt.rs2_data[t] = fp8_1_e5m2_word;
+                pkt.rs3_data[t] = 32'h00000000;
+            end
+            pkt.op_args.tcu.fmt_s = 4'(TCU_FP8E5M2_ID);
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++)
+                        if (res.data[ii*TCU_TC_N+jj] !== 32'h40800000)
+                            ok = 0;
+                if (ok) begin
+                    $display("[PASS] %-28s 4.0 = 0x40800000", "TC_FP8E5M2_normal");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s got=0x%08X exp=0x40800000",
+                             "TC_FP8E5M2_normal", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // TC_FP8E5M2_inf: A=+Inf, B=1.0 E5M2 → Inf × 1.0 = +Inf = 0x7F800000
+            // ----------------------------------------------------------------
+            fire_ldscale(8'd127, 8'd127);
+            for (int t = 0; t < `SIMD_WIDTH; t++) begin
+                pkt.rs1_data[t] = fp8_inf_e5m2_word;
+                pkt.rs2_data[t] = fp8_1_e5m2_word;
+            end
+            pkt.op_args.tcu.fmt_s = 4'(TCU_FP8E5M2_ID);
+            fire_dispatch(pkt);
+            wait_commit(res);
+            begin
+                bit ok;
+                ok = 1;
+                for (int ii = 0; ii < TCU_TC_M; ii++)
+                    for (int jj = 0; jj < TCU_TC_N; jj++)
+                        if (res.data[ii*TCU_TC_N+jj] !== 32'h7F800000)
+                            ok = 0;
+                if (ok) begin
+                    $display("[PASS] %-28s +Inf = 0x7F800000", "TC_FP8E5M2_inf");
+                    pass_cnt++;
+                end else begin
+                    $display("[FAIL] %-28s got=0x%08X exp=0x7F800000",
+                             "TC_FP8E5M2_inf", res.data[0]);
+                    fail_cnt++;
+                end
+            end
+        end
+`endif // TCU_BHF
 `endif // EXT_AG_TCU_ENABLE
 
         $display("------------------------------------------------------------");

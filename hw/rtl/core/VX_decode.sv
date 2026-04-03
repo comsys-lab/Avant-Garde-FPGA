@@ -595,6 +595,27 @@ module VX_decode import VX_gpu_pkg::*; #(
                                 end
                                 default:;
                             endcase
+                        end else if (funct7[2:0] == 3'b101) begin
+                            // FLAT: applies micro_exp flatten in-place to one tile register.
+                            // funct7[3] = tile_type: 0=A tile (uses mexp_a), 1=B tile (uses mexp_b)
+                            // rs1 = tile register content; rd = flattened output (writeback)
+                            // Encoding: A tile: {7'h05, 5'h0, rs1, 3'h0, rd, opcode}
+                            //           B tile: {7'h0D, 5'h0, rs1, 3'h0, rd, opcode}
+                            case (funct3)
+                                3'h0: begin // FLAT
+                                    ex_type = EX_TCU;
+                                    op_type = INST_OP_BITS'(INST_TCU_WMMA);
+                                    op_args.tcu.fmt_s     = '0;
+                                    op_args.tcu.fmt_d     = '0;
+                                    op_args.tcu.step_m    = '0;
+                                    op_args.tcu.step_n    = '0;
+                                    op_args.tcu.tcu_op    = TCU_OP_FLAT;
+                                    op_args.tcu.tile_type = {1'b0, funct7[3]};
+                                    `USED_IREG (rd);
+                                    `USED_IREG (rs1);
+                                end
+                                default:;
+                            endcase
                         end
                     end
                 `else

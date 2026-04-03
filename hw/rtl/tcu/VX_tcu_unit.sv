@@ -15,8 +15,8 @@
 
 module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
-    parameter META_BITS        = 1,  // metadata bits per ctx entry (Phase C); default=1
-    parameter LOG2_GROUP_SIZE  = 1   // log2 of group size (Phase C); default=1 → pair-shared
+    parameter SCALE_BITS        = 2,  // metadata bits per ctx entry; 2 supports 3LEVEL combined shift (0-2)
+    parameter LOG2_SCALE_GROUP  = 1   // default=1 → GROUP_SIZE=2 (pair-shared)
 ) (
     `SCOPE_IO_DECL
 
@@ -46,6 +46,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 `ifdef EXT_AG_TCU_ENABLE
     // PIPE_LATENCY_FP: VX_tcu_fp internal FEDP_LATENCY + 1 (mdata/result)
+    // Phase D assert: FP path latency must remain 15cy (OT(1) + VX_tcu_fp(14))
     // Mirrors the localparam computation in VX_tcu_fp.sv.
 `ifdef TCU_DSP
     localparam PIPE_LATENCY_FP = 1 + 8 + $clog2(2*TCU_TC_K+1)*11 + 11 + 1;
@@ -60,6 +61,16 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `endif
 `endif
 /* verilator lint_on UNUSEDPARAM */
+
+`ifdef EXT_AG_TCU_ENABLE
+`ifdef TCU_BHF
+    // PIPE_LATENCY_FP = VX_tcu_fp internal latency (FEDP+mdata).
+    // Total FP path = OT(1) + PIPE_LATENCY_FP = 15cy for TCU_TC_K=2.
+    // Verify VX_tcu_fp BHF doesn't grow beyond expected (guard Phase D regression).
+    `STATIC_ASSERT (PIPE_LATENCY_FP == 14,
+        ("VX_tcu_fp BHF latency mismatch: expected 14cy, got %0d", PIPE_LATENCY_FP))
+`endif
+`endif
 
     `STATIC_ASSERT (BLOCK_SIZE == `ISSUE_WIDTH, ("must be full issue execution"));
     `STATIC_ASSERT (NUM_LANES == `NUM_THREADS, ("must be full warp execution"));
@@ -109,8 +120,8 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
         VX_tcu_operand_transformer #(
             .PIPE_LATENCY_INT (6),             // VX_tcu_int internal: FEDP(5)+mdata(1)
-            .META_BITS        (META_BITS),
-            .LOG2_GROUP_SIZE  (LOG2_GROUP_SIZE)
+            .SCALE_BITS        (SCALE_BITS),
+            .LOG2_SCALE_GROUP  (LOG2_SCALE_GROUP)
         ) operand_xformer (
             .clk            (clk),
             .reset          (reset),

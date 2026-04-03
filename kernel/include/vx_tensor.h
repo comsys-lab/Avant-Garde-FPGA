@@ -48,6 +48,12 @@ namespace detail {
   template <typename T>
   using raw_unsigned_t = typename raw_unsigned<T>::type;
 
+  // Detect if type has hw_packing field (e.g. FP8: 2 elements per 32-bit word)
+  template<typename T, typename = void>
+  struct has_hw_packing : std::false_type {};
+  template<typename T>
+  struct has_hw_packing<T, std::void_t<decltype(T::hw_packing)>> : std::true_type {};
+
   template <typename T, typename D>
   struct data_accessor_t {
     using Type = typename T::dtype;
@@ -152,10 +158,23 @@ public:
 
   static constexpr uint32_t input_is_subbyte = (It::bits < 8);
 
-  static constexpr uint32_t i_ratio = sizeof(vreg_t) / sizeof(input_t);
+  // i_ratio: elements per 32-bit register word.
+  // Types with hw_packing (e.g. FP8: [15:8] and [31:24]) override the default sizeof ratio.
+  static constexpr uint32_t i_ratio = []() -> uint32_t {
+    if constexpr (detail::has_hw_packing<It>::value) return It::hw_packing;
+    else return sizeof(vreg_t) / sizeof(input_t);
+  }();
   static constexpr uint32_t tileM = cfg::tileM;
   static constexpr uint32_t tileN = cfg::tileN;
   static constexpr uint32_t tileK = cfg::tileK * i_ratio;
+
+  // Pack 2 FP8 bytes into a vreg_t word: b0→[15:8], b1→[31:24] (matches RTL fp8*_to_bf16_word)
+  static inline vreg_t fp8_pack_word(input_t b0, input_t b1) {
+    uint32_t w = ((uint32_t)(uint8_t)b1 << 24) | ((uint32_t)(uint8_t)b0 << 8);
+    vreg_t v;
+    __builtin_memcpy(&v, &w, sizeof(v));
+    return v;
+  }
 
   using fragment_a   = fragment_t<matrix_a, input_t, cfg::NRA>;
   using fragment_b   = fragment_t<matrix_b, input_t, cfg::NRB>;
@@ -206,10 +225,15 @@ public:
             dst.data[r] = input_acessor_t::pack_row(ptr, ldm);
           }
         } else {
-          // raw_major layout
+          // row_major layout
           auto ptr = base + elem_row * ldm + elem_col;
-          assert(reinterpret_cast<uintptr_t>(ptr) % alignof(vreg_t) == 0 && "pointer must be aligned to 4 bytes");
-          dst.data[r] = *reinterpret_cast<const vreg_t *>(ptr);
+          if constexpr (detail::has_hw_packing<It>::value) {
+            // FP8: 2 consecutive K-elements → [15:8] and [31:24]
+            dst.data[r] = fp8_pack_word(ptr[0], ptr[1]);
+          } else {
+            assert(reinterpret_cast<uintptr_t>(ptr) % alignof(vreg_t) == 0 && "pointer must be aligned to 4 bytes");
+            dst.data[r] = *reinterpret_cast<const vreg_t *>(ptr);
+          }
         }
       });
     } else if constexpr (Frag::Use == matrix_b) {
@@ -232,7 +256,10 @@ public:
         if constexpr (src_layout == row_major) {
           static_assert(input_is_subbyte == false, "row_major layout is not supported for sub-byte matrix_b");
           auto ptr = base + elem_row * ldm + elem_col;
-          if constexpr (sizeof(vreg_t) == sizeof(input_t) && !input_is_subbyte) {
+          if constexpr (detail::has_hw_packing<It>::value) {
+            // FP8: 2 K-elements from consecutive rows → [15:8] and [31:24]
+            dst.data[r] = fp8_pack_word(ptr[0], ptr[ldm]);
+          } else if constexpr (sizeof(vreg_t) == sizeof(input_t) && !input_is_subbyte) {
             dst.data[r] = *reinterpret_cast<const vreg_t*>(ptr);
           } else {
             dst.data[r] = input_acessor_t::pack_row(ptr, ldm);

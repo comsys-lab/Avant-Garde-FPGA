@@ -114,7 +114,7 @@ OT는 fmt_s를 패치하지 않음.
 
 ---
 
-## 4. Phase A: micro_exp N-bit 파라미터화
+## 4. Phase A: micro_exp N-bit 파라미터화 ✅ 완료
 
 ### 4.1 배경
 
@@ -208,7 +208,7 @@ MEXP_BITS=N (확장, structure encode):
 
 ---
 
-## 5. Phase B: FLAT 명령어 (논문 구조 정합)
+## 5. Phase B: FLAT 명령어 (논문 구조 정합) ✅ 완료
 
 ### 5.1 목적
 
@@ -304,7 +304,7 @@ FLAT 후 LDTILE  재실행: tile reg 갱신 → re-FLAT 필요 (SW 관리)
 
 ---
 
-## 6. Phase C: META_BITS / LOG2_GROUP_SIZE 파라미터화
+## 6. Phase C: META_BITS / LOG2_GROUP_SIZE 파라미터화 ✅ 완료
 
 ### 6.1 목적
 
@@ -521,33 +521,49 @@ SW는 META_BITS와 LOG2_GROUP_SIZE 설정값에 맞춰 packing.
 
 ---
 
-## 7. Phase D: MXFP8 E4M3 / E5M2
+## 7. Phase D: MXFP8 E4M3 / E5M2 ✅ 완료
 
-### 6.1 OT 변경사항 (없음)
+> **구현 방식 변경**: 계획 초안(Phase D)은 VX_tcu_fp.sv 내 FP8→BF16 변환 후 BHF에
+> 전달하는 방식(Option B)이었으나, 실제 구현은 **VX_tcu_fedp_bhf.sv 내부 native FP8
+> multiply (Option A)**로 결정·완료됨. 이하 실제 구현 기준으로 기술한다.
+
+### 7.1 OT 변경사항 (없음)
 
 FP8는 흡수할 2nd-level factor가 없으므로 OT에서 **특별한 처리 없음**.
-현재 OT 코드에서 FP8 (fmt_s=5, 6)은 do_flatten_int/do_flatten_mx9 모두 해당 없어
+OT 코드에서 FP8 (fmt_s=5, 6)은 do_mx9/is_flat_in 모두 해당 없어
 default passthrough 분기로 자동 처리된다.
 
-추가 사항:
-- `VX_tcu_pkg.sv`에 `TCU_FP8E4M3_ID=5`, `TCU_FP8E5M2_ID=6` 상수 추가
+### 7.2 FEDP: Native FP8 Multiply in VX_tcu_fedp_bhf.sv ✅
 
-### 6.2 FEDP FP front-end: FP8 → BF16 변환
+**선택된 접근: Option A — native FP8 곱셈을 FEDP 내부에서 직접 수행**
 
-`VX_tcu_fp.sv`의 a_row / b_col 추출 이후, `VX_tcu_fedp_bhf` 입력 전에
-FP8 → BF16 변환을 삽입한다.
+VX_tcu_fp.sv의 BUFFER_EX 이후 a_row_r/b_col_r은 **원본 그대로** fedp_bhf에 전달된다.
+FP8→BF16 변환은 fedp_bhf의 `g_prod` generate block 내부에서 수행된다.
 
 ```
-execute_if.data.rs1_data  (32-bit per thread, 2× FP8 packed)
-    ↓ VX_tcu_fp 내부 fmt_s 검사
-    ↓ fmt_s==FP8E4M3: fp8e4m3_to_bf16() × 2 per word
-    ↓ fmt_s==FP8E5M2: fp8e5m2_to_bf16() × 2 per word
-    ↓ fmt_s==BF16/FP16: 기존 경로 그대로
-    ↓
-VX_tcu_fedp_bhf (BF16 input, 변경 없음)
+VX_tcu_fp.sv:
+  BUFFER_EX → a_row_r, b_col_r (원본 FP8 packed), fmt_s_r → fedp_bhf 직접 전달
+  (변환 없음, fmt_s_bhf wire 없음)
+
+VX_tcu_fedp_bhf.sv (g_prod 내부, element i per-lane):
+  wire [7:0] fp8_byte_a = a_row16[i][15:8];  // FP8[0] at bits[15:8]
+  wire [7:0] fp8_byte_b = b_col16[i][15:8];
+
+  // E4M3: {s[7], e[6:3], m[2:0]}, bias=7
+  // → 4b×4b mantissa multiply → FP32 result → pipelined FMT_DELAY cycles
+  // → fNToRecFN → mux at FMUL stage 출력과 동일 타이밍
+
+  // E5M2: {s[7], e[6:2], m[1:0]}, bias=15
+  // → 3b×3b mantissa multiply → FP32 result → 동일 pipeline
+
+  // case (fmt_s) 에 3'd5(E4M3), 3'd6(E5M2) 분기 추가
+  // BHF BF16 결과와 cycle-accurate으로 mux
 ```
 
-#### FP8 레지스터 패킹 규약
+**FP8→BF16 함수**: VX_tcu_fp.sv에 원본 코드가 블록 주석으로 보존 (참고용).
+실제 계산에는 사용되지 않음.
+
+**FP8 레지스터 패킹 규약** (불변):
 
 ```
 32-bit XLEN word (FP8 모드)
@@ -556,115 +572,91 @@ VX_tcu_fedp_bhf (BF16 input, 변경 없음)
   │  bits[31:24]     │  bits[15:8]      │
   │  (각 16-bit 슬롯의 상위 8-bit 사용)   │
   └──────────────────┴──────────────────┘
-변환 후 (BF16):
-  ┌──────────────────┬──────────────────┐
-  │  BF16[1]         │  BF16[0]         │
-  │  bits[31:16]     │  bits[15:0]      │
-  └──────────────────┴──────────────────┘
 ```
 
-word당 2개 FP8 → 2개 BF16. 슬롯 수 변화 없음.
+word당 FP8 2개 → native multiply 2회. BF16/FP16과 동일 처리량.
 
-#### FP8 E4M3 → BF16 변환 규칙
-
-```
-입력: {s[1], e[3:0], m[2:0]}  (bias=7)
-
-정상값 (e≠0000, e≠1111):
-  BF16_exp = e_fp8 + 120   (= e_fp8 - 7 + 127)
-  BF16 = {s, e_fp8 + 8'd120, m[2:0], 4'b0}
-
-Zero: e==0 && m==0  →  16'b0
-
-Subnormal (e==0, m≠0): HANDLE_SUBNORMAL 파라미터로 분기 (§6.3)
-
-NaN: e==4'hF && m≠0  →  BF16 NaN = {s, 8'hFF, 7'h40}
-(E4M3: Infinity 없음)
-```
-
-#### FP8 E5M2 → BF16 변환 규칙
+#### FP8 E4M3 native multiply 수식
 
 ```
-입력: {s[1], e[4:0], m[1:0]}  (bias=15)
+입력: a = {sa[1], ea[3:0], ma[2:0]}, b = {sb[1], eb[3:0], mb[2:0]}  (bias=7)
 
-정상값:
-  BF16_exp = e_fp8 + 112   (= e_fp8 - 15 + 127)
-  BF16 = {s, e_fp8 + 8'd112, m[1:0], 5'b0}
+4b×4b mantissa multiply:
+  maf = {1'b1, ma};  mbf = {1'b1, mb};  pm = maf * mbf;  // 8-bit product
+  fexp = ea + eb + 113 + pm[7]   // 113 = 127(FP32 bias) - 14(2×bias)
+  fman = pm[7] ? {pm[6:0], 16'b0} : {pm[5:0], 17'b0}
 
-Zero: e==0 && m==0  →  16'b0
-
-Subnormal (e==0, m≠0): HANDLE_SUBNORMAL 파라미터로 분기 (§6.3)
-
-Infinity: e==5'h1F && m==0  →  BF16 Inf = {s, 8'hFF, 7'b0}
-NaN:      e==5'h1F && m≠0   →  BF16 NaN = {s, 8'hFF, 7'h40}
+Special cases:
+  ea==0 || eb==0 → ±0 (flush-to-zero)
+  ea==4'hF: ma≠0 → qNaN; ma==0 → saturated max {s, 8'hFE, 7'h7F}
+  eb==4'hF: same
 ```
 
-### 6.3 HANDLE_SUBNORMAL 파라미터
+#### FP8 E5M2 native multiply 수식
+
+```
+입력: a = {sa[1], ea[4:0], ma[1:0]}, b = {sb[1], eb[4:0], mb[1:0]}  (bias=15)
+
+3b×3b mantissa multiply:
+  maf = {1'b1, ma};  mbf = {1'b1, mb};  pm = maf * mbf;  // 6-bit product
+  fexp = ea + eb + 97 + pm[5]    // 97 = 127 - 30(2×bias)
+  fman = pm[5] ? {pm[4:0], 18'b0} : {pm[3:0], 19'b0}
+
+Special cases:
+  ea==0 || eb==0 → ±0
+  ea==5'h1F: ma==0 → ±Inf; ma≠0 → qNaN
+  eb==5'h1F: same
+```
+
+### 7.3 HANDLE_SUBNORMAL 파라미터
 
 ```systemverilog
 parameter HANDLE_SUBNORMAL = 0   // 0: flush to zero (default, inference)
                                  // 1: full CLZ normalization (spec compliance)
 ```
 
-| 값 | subnormal 처리 | HW cost | 용도 |
-|:---:|---|:---:|---|
-| 0 (default) | flush to zero | 낮음 | inference |
-| 1 | CLZ + normalize | 높음 | spec 완전 준수 |
+### 7.4 FEDP BHF post-accumulation exp_total 스케일
 
-### 6.4 FEDP BHF post-accumulation exp_total 스케일
+`VX_tcu_fedp_bhf.sv`에 exp_total 스케일 스테이지가 이미 구현되어 있다.
+리덕션 후 FP32 결과의 exponent에 exp_total을 combinational하게 가산한다.
+레이턴시 변화 없음 (13cy 유지).
 
-논문 정의에 따라 1st-level scale (block_exp)은 FEDP에서 적용한다.
+**Phase E 이후**: exp_total은 tcu_args_t의 scale_A[i] + scale_B[j] - 254로 계산되어
+BUFFER_EX 후 exp_total_r로 전달된다 (per-(i,j), §8.1 참조).
 
-```
-d_out = dot(BF16_A, BF16_B) + C
-
-// 신규 스테이지: 2^exp_total 적용 (exponent-only shift)
-d_scaled.exp  = clamp(d_out.exp + exp_total, 0, 255)
-d_scaled.sign = d_out.sign
-d_scaled.mant = d_out.mant   // rounding 없음, mantissa 그대로
-```
-
-- **rounding 없음**: exponent shift만 수행. spec에 "rounding 없음, underflow flush" 명시 필요.
-- **기존 포맷 no-op**: BF16/FP16/FP32는 `exp_total=0` 기본값 → 덧셈 후 동일.
-
-**레이턴시**: 스케일 스테이지 추가로 BHF FEDP 총 레이턴시 +1 cycle.
-
-### 6.5 수정 파일 목록
+### 7.5 수정 파일 목록 (실제 구현 기준)
 
 | 파일 | 변경 내용 |
 |------|-----------|
-| `VX_tcu_pkg.sv` | `TCU_FP8E4M3_ID=5`, `TCU_FP8E5M2_ID=6`; `trace_fmt` 업데이트 |
-| `VX_tcu_fp.sv` | `HANDLE_SUBNORMAL` 파라미터; fp8 변환 함수; front-end 분기; `exp_total_r` 연결; `FEDP_LATENCY` +1 |
-| `VX_tcu_fedp_bhf.sv` | post-accumulation exp_total 스케일 스테이지; `TOTAL_LATENCY` +1 |
-| `VX_tcu_unit.sv` | `PIPE_LATENCY_FP` +1; compile-time latency assert 추가 |
+| `VX_tcu_pkg.sv` | `TCU_FP8E4M3_ID=5`, `TCU_FP8E5M2_ID=6` 상수 (이미 존재) |
+| `VX_tcu_fp.sv` | `HANDLE_SUBNORMAL` 파라미터; FP8→BF16 함수 블록 주석 보존; fmt_s_r 직접 fedp_bhf 전달; `UNUSED_VAR`에서 `fmt_s`, `exp_total` 제거 |
+| `VX_tcu_fedp_bhf.sv` | **g_prod 내 native FP8 multiply 추가** (E4M3/E5M2); VX_pipe_register FMT_DELAY; case 3'd5/3'd6 분기 |
 | `VX_tcu_operand_transformer.sv` | **변경 없음** |
+| `sim/simx/tensor_unit.cpp` | `fp8e4m3_to_float()` / `fp8e5m2_to_float()` 헬퍼; `ag_wmma()` FP8 분기 (FP8→float + dot + ldexp(exp_total[i][j]) + C) |
+| `hw/rtl/tcu/tb_wmma/tb_tcu_wmma.sv` | FP8 TC 3개 (E4M3_wmma/neg, E5M2_wmma) |
 
-### 6.6 레이턴시 분석 (TCU_BHF, TCU_TC_K=2)
+### 7.6 레이턴시 분석 (TCU_BHF, TCU_TC_K=2)
 
 ```
 LEVELS = clog2(2×TCU_TC_K) = 2
 FRED_LATENCY = 2 × (FADD(2) + FRND(1)) = 6cy
 TOTAL_LATENCY = (FMUL(2)+FRND(1)) + 1 + FRED(6) + (FADD(2)+FRND(1)) = 13cy
+  ※ exp_total shift는 FADD 전 combinational 처리 → 추가 사이클 없음
 
-[현재 Phase 10]
-  BHF FEDP:  13cy
-  FP path:   OT(1) + VX_tcu_fp(14) = 15cy
-  INT path:  OT(1) + VX_tcu_int(6) = 7cy  → TCU_UNIT_PIPE_LATENCY=7
-
-[Phase D 후]
-  BHF FEDP:  14cy (+1 exp_total stage)
-  FP path:   OT(1) + VX_tcu_fp(15) = 16cy
-  INT path:  변화 없음 (7cy)
+[현재 Phase 10 / Phase D 후 동일]
+  BHF FEDP:  13cy  (변화 없음)
+  FP path:   OT(1) + VX_tcu_fp(14) = 15cy  (변화 없음)
+  INT path:  OT(1) + VX_tcu_int(6) = 7cy   → TCU_UNIT_PIPE_LATENCY=7
 ```
 
 FP path는 이미 INT path보다 레이턴시가 크다.
-scoreboard는 commit writeback 신호 기반이므로 FP latency 증가가 정합성에 영향 없다.
+scoreboard는 commit writeback 신호 기반이므로 FP/INT latency 불일치가 정합성에 영향 없다.
 
-compile-time assert (`VX_tcu_unit.sv`):
+compile-time assert (`VX_tcu_unit.sv`) — Phase D에서 추가 권장:
 
 ```systemverilog
-`STATIC_ASSERT(PIPE_LATENCY_FP == 15,
-    ("VX_tcu_fp latency mismatch: expected 15, got %0d", PIPE_LATENCY_FP))
+`STATIC_ASSERT(PIPE_LATENCY_FP == 14,
+    ("VX_tcu_fp BHF latency mismatch: expected 14cy (total FP=OT(1)+14=15), got %0d", PIPE_LATENCY_FP))
 ```
 
 ---
@@ -694,60 +686,178 @@ compile-time assert (`VX_tcu_unit.sv`):
 
 ---
 
-## 9. 미래 FP8 Native FEDP 확장 경로
+## 9. FP8 Native FEDP ✅ 구현 완료 (Phase D에서 달성)
 
-FP8→BF16은 lossless이므로 현재 Phase D 전략은 정밀도 손실 없음.
-throughput/power 최적화가 필요하다면:
+Phase D에서 FP8→BF16-then-BHF 방식이 아닌 **native FP8 multiply**를
+VX_tcu_fedp_bhf.sv 내부에 직접 구현했다. §7.2 참조.
 
 ```
-현재 FP8 pathway:
-  OT → [passthrough] → VX_tcu_fp (FP8→BF16 후 BHF MAC)
-
-미래 FP8 native pathway 추가:
-  OT → [passthrough] → pe_switch
-                           ├── VX_tcu_fp   (BF16/FP16/FP32/FP8→BF16)
-                           ├── VX_tcu_fp8  (FP8 native MAC, 향후)
-                           └── VX_tcu_int  (I8/MX9/I32)
+현재 FP8 pathway (Phase D 이후):
+  OT → [passthrough] → VX_tcu_fp → VX_tcu_fedp_bhf
+                                     (내부 g_prod: fmt_s_r==5/6 → native FP8 × FP8 → FP32)
 ```
 
-OT가 flattening만 담당하므로 FEDP를 추가해도 **OT 수정 불필요**.
+OT가 flattening만 담당하므로 FEDP 내부 변경에 OT 수정 불필요 — 설계 원칙 유지됨.
+
+> **처리량**: word당 FP8 2개 (BF16과 동일). 4개/word 밀도 최적화는 TCU_TC_K 2배 확장이
+> 필요하여 미래 과제로 남긴다.
 
 ---
 
-## 10. 호환성 체크리스트
+## 10. Phase E: per-row/col scale 벡터 (구현완료, 검증 대기)
 
-| 항목                         | Phase A                | Phase B                 | Phase C                       | Phase D                   | Phase E |
+Avant-Garde 논문의 per-block per-row/column scale을 HW로 지원한다.
+기존 구현은 tile 단위 단일 scalar exp_total을 OT에서 계산하여 payload에 넣었으나,
+논문에서는 A matrix의 각 행(row), B matrix의 각 열(col)마다 독립적인 E8M0 스케일을 가진다.
+
+### 10.1 구조 변경 요약
+
+#### INST_ARGS_BITS 확장 (EXT_AG_TCU_ENABLE 전용)
+
+```
+기존: INST_ARGS_BITS = ALU_TYPE_BITS(2) + XLEN(32) + 3 = 37b
+변경: INST_ARGS_BITS = 37 + 16 = 53b  (EXT_AG_TCU_ENABLE 시)
+  +16b = scale_A[TC_M×8b] + scale_B[TC_N×8b]
+       = [15:0] + [15:0] = 32b 신규 필드 (exp_total 10b + padding 6b = 16b 교체 → +16b 순증)
+```
+
+다른 arg 타입(alu, fpu, lsu, csr, wctl)은 자동으로 `__tcu_scale_pad` 16b 패딩 추가.
+
+#### tcu_args_t 변경
+
+```systemverilog
+// Phase E 이전 (EXT_AG_TCU_ENABLE):
+logic [(INST_ARGS_BITS-31)-1:0]  __padding;   // 6b
+logic signed [9:0]               exp_total;   // OT 계산 스칼라
+
+// Phase E 이후:
+logic [15:0]  scale_A;   // [i*8+:8] = scale_A[i], E8M0 unsigned (TC_M=2 → 16b)
+logic [15:0]  scale_B;   // [j*8+:8] = scale_B[j], E8M0 unsigned (TC_N=2 → 16b)
+// exp_total 제거
+```
+
+#### VX_tcu_scale_ctx.sv: scalar → vector 저장소
+
+```systemverilog
+// 기존: reg [TCU_EXP_BITS-1:0] scale_a_r/scale_b_r [NUM_WARPS]
+// 변경: reg [TC_M*TCU_EXP_BITS-1:0] scale_A_r [NUM_WARPS]
+//       reg [TC_N*TCU_EXP_BITS-1:0] scale_B_r [NUM_WARPS]
+
+// LDSCALE packing (Phase E):
+//   [7:0]   = scale_A[0]   (A row 0)
+//   [15:8]  = scale_A[1]   (A row 1)
+//   [23:16] = scale_B[0]   (B col 0)
+//   [31:24] = scale_B[1]   (B col 1)
+```
+
+#### OT: exp_total_comb 제거, scale 벡터 payload 기록
+
+```systemverilog
+// 기존: ot_data_next.op_args.tcu.exp_total = exp_total_comb;
+// 변경: ot_data_next.op_args.tcu.scale_A = rd_scale_A;
+//       ot_data_next.op_args.tcu.scale_B = rd_scale_B;
+
+// MX9 보정: -10을 scale_A/B 각각에서 -5씩 분배
+//   (scale_A[i]-5) + (scale_B[j]-5) - 254 = orig_exp_total - 10 ✓
+```
+
+#### VX_tcu_fp.sv / VX_tcu_int.sv: per-(i,j) exp_total
+
+```systemverilog
+// 기존 BUFFER_EX: exp_total_r 버퍼
+// 변경: scale_A_ij_r, scale_B_ij_r 버퍼 (slice from payload)
+
+wire signed [TCU_EXP_TOTAL-1:0] exp_total_r =
+    $signed(TCU_EXP_TOTAL'({2'b0, scale_A_ij_r}))
+  + $signed(TCU_EXP_TOTAL'({2'b0, scale_B_ij_r}))
+  - $signed(TCU_EXP_TOTAL'(2 * TCU_EXP_BIAS));
+// exp_total_r은 FEDP로 전달 (인터페이스 변경 없음)
+```
+
+### 10.2 simx 변경
+
+```cpp
+// ScaleContext: scalar → per-row/col vector
+//   scale_A[wid][i], scale_B[wid][j]  (cfg::tcM, cfg::tcN 크기)
+
+// ldscale() packing 변경:
+//   sa[0]=[7:0], sa[1]=[15:8], sb[0]=[23:16], sb[1]=[31:24]
+
+// ag_wmma(): exp_total = scale_ctx_.exp_total(wid, i, j) (per-(i,j))
+```
+
+### 10.3 Testbench 변경
+
+```systemverilog
+// fire_ldscale(): 기존 {16'b0, scale_b, scale_a} → {sB1, sB0, sA1, sA0}
+//   scalar 유지: sA0=sA1=scale_a, sB0=sB1=scale_b (기존 TC 호환)
+
+// fire_ldscale_vec(): 신규 — per-row/col 독립 설정
+task automatic fire_ldscale_vec(sA0, sA1, sB0, sB1);
+```
+
+### 10.4 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `VX_gpu_pkg.sv` | INST_ARGS_BITS +16b (AG_TCU_ENABLE 시); alu_args_t 16b 패드; tcu_args_t: exp_total→scale_A/B |
+| `VX_tcu_scale_ctx.sv` | scalar → vector 저장소; packing 변경 |
+| `VX_tcu_operand_transformer.sv` | exp_total_comb 제거; rd_scale_A/B → payload; MX9 -10 분배 |
+| `VX_tcu_fp.sv` | scale_A_ij_r/scale_B_ij_r 버퍼; per-(i,j) exp_total_r |
+| `VX_tcu_int.sv` | 동일 |
+| `sim/simx/tensor_unit.cpp` | ScaleContext vector화; ldscale() packing; ag_wmma() per-(i,j) |
+| `hw/rtl/tcu/tb_wmma/tb_tcu_wmma.sv` | fire_ldscale() packing 수정; fire_ldscale_vec() 추가 |
+
+### 10.5 검증 (대기 중)
+
+```bash
+# L5 tb_wmma (기존 20TC + 신규 per-row/col TC)
+cd hw/rtl/tcu/tb_wmma && make && make run
+
+# simx e2e (LDSCALE packing 변경 포함)
+cd tests/regression/sgemm_ag_tcu && make test-simx
+```
+
+기존 TC가 모두 scalar uniform scale (sA0=sA1, sB0=sB1) 이므로 결과 동일해야 함.
+
+---
+
+## 11. 호환성 체크리스트
+
+| 항목                         | Phase A                | Phase B                 | Phase C                       | Phase D (FP8)             | Phase E (scale vec) |
 |------|:-------:|:-------:|:-------:|:-------:|:-------:|
-| FP32/FP16/BF16 WMMA         | ✅                     | ✅                     | ✅ META_BITS=1 → no-op        | ✅ exp_total=0 → no-op    | ✅ |
-| MX9 WMMA                    | ✅ MEXP_BITS=1 → no-op | ⚠️ FLAT 시퀀스로 변경    | ✅ LOG2_GROUP_SIZE=1 → no-op  | ✅                        | ✅ |
-| MXINT8/I8 WMMA              | ✅                     | ⚠️ FLAT 시퀀스로 변경    | ✅                            | ✅                        | ✅ |
-| LDSCALE/LDTILE/LDMICRO      | ✅                     | ✅                     | ✅ 포트명 변경 (wr_meta_a/b)  | ✅                        | ✅ |
-| pe_switch 라우팅             | ✅                     | ✅                     | ✅ 변경 없음                   | ✅ FP8 bit[3]=0 → FP path | ⚠️ fmt_s 재정의 시 |
-| scoreboard 정합성            | ✅                     | ✅ FLAT wb=1 경로 추가  | ✅ 변경 없음                   | ✅ commit writeback 기반   | - |
-| fedp_bhf STATIC_ASSERT      | ✅                     | ✅                     | ✅ 변경 없음                   | ⚠️ TOTAL_LATENCY +1 필수  | ✅ |
-| VX_tcu_operand_transformer  | ⚠️ MEXP_BITS 추가       | ⚠️ is_nop_in FLAT 포함 | ⚠️ META_BITS/LOG2_GROUP_SIZE  | ✅ 변경 없음                | ✅ |
+| FP32/FP16/BF16 WMMA         | ✅                     | ✅                     | ✅ META_BITS=1 → no-op        | ✅ exp_total=0             | ✅ scale=127 → exp=0 |
+| MX9 WMMA                    | ✅ MEXP_BITS=1 → no-op | ✅ FLAT 시퀀스          | ✅ LOG2_GROUP_SIZE=1 → no-op  | ✅                        | ✅ -10 분배 |
+| MXINT8/I8 WMMA              | ✅                     | ✅ FLAT 시퀀스          | ✅                            | ✅                        | ✅ scalar uniform |
+| FP8 WMMA                    | -                      | -                      | -                             | ✅ native FEDP            | ✅ per-(i,j) exp |
+| LDSCALE/LDTILE/LDMICRO      | ✅                     | ✅                     | ✅ 포트명 변경 (wr_meta_a/b)  | ✅                        | ⚠️ packing 변경 |
+| fire_ldscale TB              | ✅                     | ✅                     | ✅                            | ✅                        | ⚠️ packing 수정 |
+| pe_switch 라우팅             | ✅                     | ✅                     | ✅ 변경 없음                   | ✅ FP8 bit[3]=0 → FP path | ✅ 변경 없음 |
+| VX_tcu_operand_transformer  | ⚠️ MEXP_BITS 추가       | ⚠️ is_nop_in FLAT 포함 | ⚠️ META_BITS/LOG2_GROUP_SIZE  | ✅ 변경 없음                | ⚠️ exp_total 제거 |
 
-### 위험 요소
+### 위험 요소 (현재 활성)
 
-1. **Phase B — FLAT UOP 시퀀싱**: NRA(A tile) + NRB(B tile) UOP를 단일 FLAT 명령어에서 처리.
-   VX_tcu_uops에서 WMMA m/n/k 인덱싱과 별개의 sequential 레지스터 인덱싱 로직 필요.
+1. **Phase E — INST_ARGS_BITS**: EXT_AG_TCU_ENABLE 외 빌드에서 INST_ARGS_BITS 불변.
+   non-AG 빌드 및 다른 arg 타입(alu, fpu 등) PACKAGE_ASSERT 통과 필요.
 
-2. **Phase B — short commit path**: FLAT 결과가 FEDP를 통하지 않고 commit으로 직접 전달.
-   VX_tcu_unit에서 FLAT 전용 result_if → per_block_result_if 연결 신규 구현 필요.
+2. **Phase E — LDSCALE packing 변경**: 기존 simx/rtlsim/커널 LDSCALE 발행 측
+   모두 새 packing으로 업데이트 필요. {sB1, sB0, sA1, sA0} 순서 확인 필수.
 
-3. **Phase B — micro_ctx stale**: FLAT 후 LDMICRO 재실행 시 tile registers가 stale해짐.
-   re-FLAT 필요. SW가 관리해야 함.
+3. **Phase E — TB fire_ldscale scalar 호환**: sA0=sA1=scale_a 가정.
+   TC_M≠2 이거나 per-row 독립 TC 시 fire_ldscale_vec 사용.
 
-4. **Phase C — LOG2_GROUP_SIZE=0 storage 증가**: byte마다 독립 ctx → micro_ctx 4×.
-   현재 사용 계획 없음. 유효 범위 0~2 명시 필요.
+4. **Phase E — MX9 -10 분배 오버플로**: scale_A[i]-5 시 underflow(0→251 wrap) 위험.
+   E8M0 unsigned 8b이므로 scale < 5이면 오동작. 일반적인 사용 범위에서 문제 없음.
 
-5. **Phase D — FP8 subnormal HW cost**: `HANDLE_SUBNORMAL=0` (flush-to-zero) 기본값.
+---
 
-6. **Phase D — exp_total 부호 처리**: `clamp(exp + exp_total, 0, 255)` 구현 시
-   음수 exp_total의 부호 확장 처리 주의.
+## 12. (구) 호환성 체크리스트
 
-7. **Phase D — FP8 NaN 인코딩 차이**: E4M3(infinity 없음) vs E5M2(IEEE-like).
-   BF16 NaN 매핑 정확성 검증 필요.
+> **이 섹션은 Phase D까지의 위험 요소 기록이다. 최신 사항은 §11 참조.**
+   BF16 변환 시 NaN(m≠0)과 구분하여 `{s, 8'hFE, 7'h7F}` 출력 필요.
+
+8. **Phase D — native FP8 접근**: fmt_s_bhf 패치 불필요.
+   fedp_bhf 내부 case(fmt_s_r)에서 3'd5/3'd6을 직접 처리.
 
 ---
 
@@ -785,12 +895,13 @@ OT가 flattening만 담당하므로 FEDP를 추가해도 **OT 수정 불필요**
 
 - Phase A 후: MEXP_BITS=1 regression (L4 7/7 + L5 9/9) ✅ 완료
 - Phase B 후: FLAT TC (L4 13/13, L5 13/13) ✅ 완료
-- Phase C 후: META_BITS=1/LOG2_GROUP_SIZE=1 full regression (기본값 bit-identical 확인)
-- Phase D 후: FP8 TC + full regression
+- Phase C 후: META_BITS=1/LOG2_GROUP_SIZE=1 full regression ✅ 완료 (L4 13/13, L5 20/20)
+- Phase D 후: FP8 TC + full regression ✅ 완료 (L5 20/20 PASS, simx/rtlsim PASS)
+- Phase E 후: 기존 20TC + 검증 대기 ⏳
 
 ---
 
-## 12. 구현 순서 요약
+## 13. 구현 순서 요약
 
 ```
 Phase A (micro_exp N-bit 파라미터화)  ✅ 완료
@@ -808,26 +919,34 @@ Phase B (FLAT 명령어 — 논문 구조 정합)  ✅ 완료
   ├── TB                           : LDMICRO → FLAT → WMMA 시퀀스; FLAT TC 추가
   └── FLAT TC + full regression (L4 13/13, L5 13/13) ✅
 
-Phase C (META_BITS / LOG2_GROUP_SIZE 파라미터화)
+Phase C (META_BITS / LOG2_GROUP_SIZE 파라미터화)  ✅ 완료
   ├── VX_tcu_micro_ctx.sv          : MEXP_BITS→META_BITS; LOG2_GROUP_SIZE; 포트명 변경
   ├── VX_tcu_operand_transformer.sv: 동일 파라미터; decode_meta(); flatten_int8_word 루프화
   ├── VX_tcu_unit.sv               : instantiation 파라미터 이름 업데이트
-  └── META_BITS=1/LOG2_GROUP_SIZE=1 regression (bit-identical 확인)
+  └── META_BITS=1/LOG2_GROUP_SIZE=1 full regression (L4 13/13, L5 20/20) ✅
 
-Phase D (MXFP8)
-  ├── VX_tcu_pkg.sv                : TCU_FP8E4M3_ID=5, TCU_FP8E5M2_ID=6
-  ├── VX_tcu_fp.sv                 : HANDLE_SUBNORMAL, fp8 변환, exp_total 연결,
-  │                                  FEDP_LATENCY +1
-  ├── VX_tcu_fedp_bhf.sv           : exp_total 스케일 스테이지, TOTAL_LATENCY +1
-  ├── VX_tcu_unit.sv               : PIPE_LATENCY_FP +1, STATIC_ASSERT
-  └── FP8 TC + full regression
+Phase D (MXFP8 — native FP8 multiply in FEDP)  ✅ 완료
+  ├── VX_tcu_fedp_bhf.sv           : g_prod 내 E4M3/E5M2 native multiply 추가
+  │                                  (FP8→BF16 변환 방식 미사용 → 블록 주석 보존)
+  ├── VX_tcu_fp.sv                 : HANDLE_SUBNORMAL 파라미터; UNUSED_VAR 정리;
+  │                                  FP8→BF16 함수 블록 주석 보존 (참고용)
+  ├── VX_tcu_operand_transformer.sv: 변경 없음
+  ├── sim/simx/tensor_unit.cpp     : fp8_to_float() 헬퍼; ag_wmma() FP8 분기
+  ├── tb_wmma/tb_tcu_wmma.sv       : FP8 TC 3개 (E4M3×2, E5M2×1)
+  └── FP8 TC + full regression (L5 20/20, simx 11/11, rtlsim 7/7) ✅
 
-Phase E 착수 전
+Phase E (per-row/col scale 벡터)  ⏳ 구현완료, 검증 대기
+  ├── VX_gpu_pkg.sv                : INST_ARGS_BITS +16b; alu_args_t pad; tcu_args_t scale_A/B
+  ├── VX_tcu_scale_ctx.sv          : scalar → vector 저장소; packing 변경
+  ├── VX_tcu_operand_transformer.sv: exp_total_comb 제거; scale_A/B → payload; MX9 -10 분배
+  ├── VX_tcu_fp.sv                 : per-(i,j) scale_A_ij_r/scale_B_ij_r BUFFER_EX; exp_total_r
+  ├── VX_tcu_int.sv                : 동일
+  ├── sim/simx/tensor_unit.cpp     : ScaleContext vector화; ldscale() packing; ag_wmma() per-(i,j)
+  ├── tb_wmma/tb_tcu_wmma.sv       : fire_ldscale() packing 수정; fire_ldscale_vec() 추가
+  └── ⏳ 검증 대기: make run (tb_wmma 20/20) + make test-simx
+
+Phase F (MXFP6 / MXFP4, 향후)
   ├── fmt_s 인코딩 재정의 검토
-  └── OT/FEDP combinational depth timing 분석
-
-Phase E (MXFP6 / MXFP4)
-  ├── VX_tcu_pkg.sv                : FP6/FP4 ID 추가
   ├── VX_tcu_fp.sv                 : fp6_to_bf16() 추가
   ├── FP4 경로 결정 후 구현
   └── tb 추가 + full regression
