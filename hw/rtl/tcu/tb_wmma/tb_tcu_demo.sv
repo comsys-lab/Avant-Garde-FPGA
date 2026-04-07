@@ -75,6 +75,53 @@ module tb_tcu_demo;
     endgenerate
 
     // =========================================================================
+    // Waveform probe signals — byte-level breakdown for easy inspection
+    // =========================================================================
+
+    // ── Dispatch input: A operand byte breakdown (thread 0, word 0) ──────────
+    // pair0 = bytes [1:0], pair1 = bytes [3:2]
+    wire [7:0] disp_a_b0 = dispatch_if[0].data.rs1_data[0][ 7: 0]; // pair0, byte0
+    wire [7:0] disp_a_b1 = dispatch_if[0].data.rs1_data[0][15: 8]; // pair0, byte1
+    wire [7:0] disp_a_b2 = dispatch_if[0].data.rs1_data[0][23:16]; // pair1, byte0
+    wire [7:0] disp_a_b3 = dispatch_if[0].data.rs1_data[0][31:24]; // pair1, byte1
+    // B operand
+    wire [7:0] disp_b_b0 = dispatch_if[0].data.rs2_data[0][ 7: 0];
+    wire [7:0] disp_b_b1 = dispatch_if[0].data.rs2_data[0][15: 8];
+    wire [7:0] disp_b_b2 = dispatch_if[0].data.rs2_data[0][23:16];
+    wire [7:0] disp_b_b3 = dispatch_if[0].data.rs2_data[0][31:24];
+    // tcu_op / fmt_s shortcuts
+    wire [2:0] disp_tcu_op = dispatch_if[0].data.op_args.tcu.tcu_op;
+    wire [3:0] disp_fmt_s  = dispatch_if[0].data.op_args.tcu.fmt_s;
+
+    // ── OT output: A operand after Operand Transformer (1 cycle later) ───────
+    // fmt_s: 3LEVEL(3) → I8(9) patched by OT; bytes show flatten result
+`ifdef EXT_AG_TCU_ENABLE
+    wire        ot_valid  = dut.g_blocks[0].ot_execute_if.valid;
+    wire [3:0]  ot_fmt_s  = dut.g_blocks[0].ot_execute_if.data.op_args.tcu.fmt_s;
+    wire [2:0]  ot_tcu_op = dut.g_blocks[0].ot_execute_if.data.op_args.tcu.tcu_op;
+    wire [31:0] ot_a_word = dut.g_blocks[0].ot_execute_if.data.rs1_data[0];
+    wire [31:0] ot_b_word = dut.g_blocks[0].ot_execute_if.data.rs2_data[0];
+    // OT output byte breakdown — compare with disp_a_bX above
+    wire [7:0]  ot_a_b0   = ot_a_word[ 7: 0]; // pair0: expect sat(disp_a_b0 << shift)
+    wire [7:0]  ot_a_b1   = ot_a_word[15: 8]; // pair0
+    wire [7:0]  ot_a_b2   = ot_a_word[23:16]; // pair1: different shift than pair0
+    wire [7:0]  ot_a_b3   = ot_a_word[31:24]; // pair1
+    wire [7:0]  ot_b_b0   = ot_b_word[ 7: 0];
+    wire [7:0]  ot_b_b1   = ot_b_word[15: 8];
+    wire [7:0]  ot_b_b2   = ot_b_word[23:16];
+    wire [7:0]  ot_b_b3   = ot_b_word[31:24];
+    // PE path selector: 0=FP, 1=INT
+    wire        pe_sel    = dut.g_blocks[0].pe_sel_w;
+`endif
+
+    // ── Commit result: all 4 output elements ─────────────────────────────────
+    // TC_M=2, TC_N=2 → 4 output positions per UOP
+    wire [31:0] result_0 = commit_if[0].data.data[0]; // D[0][0]
+    wire [31:0] result_1 = commit_if[0].data.data[1]; // D[0][1]
+    wire [31:0] result_2 = commit_if[0].data.data[2]; // D[1][0]
+    wire [31:0] result_3 = commit_if[0].data.data[3]; // D[1][1]
+
+    // =========================================================================
     // Reference model utilities
     // =========================================================================
     function automatic real ref_pow2(input int e);
